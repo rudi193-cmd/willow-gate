@@ -45,6 +45,18 @@ The identity binding is **symmetric** (HMAC — the gate holds each agent's
 secret). Asymmetric "agent signs, gate verifies with only a public key" needs
 the `signature` field widened beyond 64 hex.
 
+## Sibling module: the friction floor
+
+`willow_gate.friction_floor` watches a different surface. WillowGate gates
+*access* — who may do what. The friction floor watches the *relationship* —
+whether an agent has stopped being **other** and started reflecting the user
+back, smoothed, while the user is escalating. It is a deterministic, model-free
+**smoke detector**: it raises a loud flag for a human, it never blocks, and it
+must run *outside* the model it watches, because a mirror can't audit itself.
+It flags sustained low friction (no pushback, no outside grounding, mostly echo)
+during a ramp — and fails loud, not open. See the module docstring; `pytest`
+pins the behavior.
+
 ## Install
 
 ```bash
