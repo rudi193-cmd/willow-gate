@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "willow-gate"
+version = "0.1.0"
+description = "Minimalist symmetric check-in/check-out gate: trust-tiered access, announce-loud-for-the-untrusted, PGP-encrypted ledger, hard stops."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Sean Campbell" }]
+dependencies = ["python-gnupg>=0.5"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/willow_gate"]
