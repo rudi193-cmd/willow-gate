@@ -290,3 +290,168 @@ def test_file_gate_cross_redacts_live_secret():
                          content_hash=ch("received"))
     assert ev["gate"]["auth_ref"] == "cred-7"
     assert led.verify().ok
+
+
+# ============================================================================
+# Hardening regression tests — one per confirmed audit finding
+# ============================================================================
+import unicodedata  # noqa: E402
+from willow_gate.custody import (  # noqa: E402
+    file_create, file_write, file_gate_cross, verify_lineage,
+    KIND_SESSION_ACTION as _SA, event_hash as _eh, canonicalize as _canon,
+)
+
+
+def _ch(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+# HARDEN-1: H5 evasion via the file/gate path and untyped actions is now caught.
+def test_h5_folds_file_write_carrying_session_id():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    file_write(led, "f", "willow", _ch("v1"), session_id="s1")   # a write, not via session_record_action
+    recon = session_check_out(led, "s1")
+    assert recon.reconciled is False and "write" in recon.mismatches
+
+
+def test_h5_folds_gate_cross_egress():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    file_gate_cross(led, "f", "willow", {"name": "jeles", "auth_ref": "cred-7"}, session_id="s1")
+    recon = session_check_out(led, "s1")
+    assert recon.reconciled is False and "egress" in recon.mismatches
+
+
+def test_h5_flags_untyped_action():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    led.append({"kind": _SA, "session_id": "s1", "actor": "willow", "note": "did a thing"})
+    recon = session_check_out(led, "s1")
+    assert recon.reconciled is False and "action" in recon.mismatches
+
+
+def test_h5_is_case_insensitive():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["Read", "WRITE"]})
+    session_record_action(led, "s1", "willow", "read")
+    session_record_action(led, "s1", "willow", "Write")
+    assert session_check_out(led, "s1").reconciled is True   # case cannot evade or false-flag
+
+
+# HARDEN-2: redaction covers plaintext field-name secrets and secret keys.
+def test_redaction_refuses_plaintext_field_secrets():
+    led = CustodyLedger()
+    for bad in ({"password": "hunter2"}, {"api_key": "letmein"}, {"client_secret": "x"}):
+        with pytest.raises(SecretRefused):
+            led.append(dict(bad, kind=_SA, actor="x"))
+    assert len(led) == 0   # nothing written
+
+
+def test_redaction_refuses_secret_as_dict_key():
+    led = CustodyLedger()
+    with pytest.raises(SecretRefused):
+        led.append({"kind": _SA, "actor": "x", "meta": {"ghp_" + "a" * 36: "v"}})
+
+
+def test_redaction_allows_credential_ids_and_hashes():
+    led = CustodyLedger()
+    led.append({"kind": KIND_FILE_GATE_CROSS, "actor": "x", "lineage_id": "f",
+                "gate": {"auth_ref": "cred-7"}, "content_hash": _ch("v"),
+                "private_key_id": "pk-1"})       # ids/refs/hashes are not secrets
+    assert led.verify().ok
+
+
+# HARDEN-3: canonicalization is sound and portable.
+def test_canon_portable_ascii_nfc_and_fixed_point():
+    ev = {"kind": _SA, "actor": "wíllow", "tool": "café", "note": None}
+    b = _canon(ev)
+    assert all(byte < 128 for byte in b)     # pure ASCII -> serializer-portable
+    assert b == b'{"actor":"w\\u00edllow","kind":"session.action","tool":"caf\\u00e9"}'
+    assert _canon(json.loads(b.decode())) == b               # fixed point
+    # NFC: combining form collapses to the precomposed form
+    assert _canon({"kind": _SA, "tool": "café"}) == _canon({"kind": _SA, "tool": "café"})
+
+
+def test_canon_rejects_non_string_keys_and_floats():
+    for bad in ({"kind": _SA, "m": {1: "a"}}, {"kind": _SA, "m": {True: "a"}},
+                {"kind": _SA, "n": 1.5}, {"kind": _SA, "n": float("nan")}):
+        with pytest.raises(ValueError):
+            _canon(bad)
+    # and via append() it fails closed (nothing written)
+    led = CustodyLedger()
+    with pytest.raises(ValueError):
+        led.append({"kind": _SA, "n": 2.5})
+    assert len(led) == 0
+
+
+# HARDEN-4: load() fails closed on a tampered or corrupt file.
+def test_load_fails_closed_on_tamper(tmp_path):
+    p = tmp_path / "c.jsonl"
+    led = CustodyLedger(path=str(p))
+    for t in ("read", "write", "grep"):
+        session_record_action(led, "s", "willow", t, ts="2026-07-11T00:00:00Z")
+    lines = p.read_text().splitlines()
+    row = json.loads(lines[1]); row["tool"] = "exfiltrate"        # tamper, do NOT re-derive
+    lines[1] = json.dumps(row)
+    p.write_text("\n".join(lines) + "\n")
+    with pytest.raises(_ChainError):
+        CustodyLedger.load(str(p))
+
+
+def test_load_fails_closed_on_corrupt_line(tmp_path):
+    p = tmp_path / "c.jsonl"
+    p.write_text('{"kind":"session.action","actor":"x","seq":0,"ledger_prev_hash":"' + ("0" * 64) + '"}\n{ broken json\n')
+    with pytest.raises(_ChainError):
+        CustodyLedger.load(str(p))
+
+
+# HARDEN-5: a session is reconciled once.
+def test_double_checkout_raises():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    session_record_action(led, "s1", "willow", "write")
+    session_check_out(led, "s1")
+    with pytest.raises(_ChainError):
+        session_check_out(led, "s1")
+
+
+# HARDEN-6: a write-first (un-provenanced) lineage does not verify.
+def test_write_first_lineage_has_no_origin():
+    led = CustodyLedger()
+    file_write(led, "f", "willow", _ch("v1"))     # no file_create first
+    res = verify_lineage(led, "f")
+    assert not res.ok and "origin" in res.reason
+
+
+# HARDEN-7: kind and ts are validated.
+def test_unknown_kind_and_bad_ts_refused():
+    led = CustodyLedger()
+    with pytest.raises(ValueError):
+        led.append({"kind": "bogus", "actor": "x"})
+    with pytest.raises(ValueError):                       # naive (no tz)
+        led.append({"kind": _SA, "actor": "x"}, ts="2026-07-11T00:00:00")
+    with pytest.raises(ValueError):                       # garbage
+        led.append({"kind": _SA, "actor": "x", "ts": "not-a-time"})
+    led.append({"kind": _SA, "actor": "x"}, ts="2026-07-11T00:00:00+00:00")   # good
+    assert led.verify().ok
+
+
+# HARDEN-8: documented limits — Tier 1 CANNOT catch these without the Tier-4 sig.
+def test_rederivation_forgery_passes_tier1_verify_documented_limit():
+    led = CustodyLedger()
+    for t in ("read", "write", "grep"):
+        session_record_action(led, "s", "willow", t)
+    # tamper a middle event AND re-derive every subsequent prev_hash
+    led._events[1]["tool"] = "exfiltrate"
+    for i in range(2, len(led._events)):
+        led._events[i]["ledger_prev_hash"] = _eh(led._events[i - 1])
+    assert led.verify().ok is True          # KNOWN LIMIT: only Tier-4 head-pinning catches this
+
+
+def test_tail_truncation_passes_tier1_verify_documented_limit():
+    led = CustodyLedger()
+    for t in ("read", "write", "grep"):
+        session_record_action(led, "s", "willow", t)
+    led._events.pop()                       # drop the tail
+    assert led.verify().ok is True          # KNOWN LIMIT: nothing pins the head at Tier 1

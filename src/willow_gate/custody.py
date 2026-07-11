@@ -11,8 +11,14 @@ you four properties, each with a test that proves it:
 
   * APPEND-ONLY by construction. There is no update() and no delete(). The only
     write is append(); the history cannot be edited through this API.
-  * HASH-CHAINED. Every event carries the hash of the one before it, so altering
-    any past event breaks verification of every event after it.
+  * HASH-CHAINED. Every event carries the hash of the one before it, so an
+    IN-PLACE alteration of any past event breaks verification of every event
+    after it. NOTE the boundary: an attacker who rewrites a past event AND
+    re-derives every subsequent ledger_prev_hash produces a self-consistent
+    chain that verify() accepts, and a tail-truncation also passes — nothing here
+    pins the head. Detecting those requires the Tier-4 checkpoint signature that
+    commits the head externally. Tier 1 gives tamper-detection for in-place
+    edits; Tier 4 gives tamper-evidence for the whole chain.
   * CANONICAL. Hashes are computed over a byte-stable canonical form (sorted
     keys, compact, UTF-8, nulls omitted). Reordering input keys cannot change a
     hash — otherwise the chain and any future signature would be meaningless.
@@ -42,6 +48,8 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+import unicodedata
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 
@@ -60,6 +68,24 @@ KIND_SESSION_CHECKIN = "session.checkin"
 KIND_SESSION_ACTION = "session.action"
 KIND_SESSION_CHECKOUT = "session.checkout"
 KIND_CAPTURE_GAP = "capture_gap"
+
+# The closed set of legal kinds. append() refuses anything else.
+_KINDS = frozenset({
+    KIND_FILE_CREATE, KIND_FILE_READ, KIND_FILE_WRITE, KIND_FILE_GATE_CROSS,
+    KIND_FILE_CHECKOUT, KIND_SESSION_CHECKIN, KIND_SESSION_ACTION,
+    KIND_SESSION_CHECKOUT, KIND_CAPTURE_GAP,
+})
+
+# Which capability a session-tagged event exercises, for H5 reconciliation. A
+# capability recorded through ANY of these paths — not just session.action —
+# must be reconciled, or the check can be evaded by routing the write through the
+# file-custody path.
+_CAPABILITY_BY_KIND = {
+    KIND_FILE_CREATE: "write",
+    KIND_FILE_WRITE: "write",
+    KIND_FILE_READ: "read",
+    KIND_FILE_GATE_CROSS: "egress",
+}
 
 # Fields the writer owns. A caller may not set these; the ledger assigns them.
 _RESERVED = ("seq", "ledger_prev_hash")
@@ -92,18 +118,46 @@ _SECRET_PATTERNS = (
 )
 
 
+# Field names that strongly imply a *raw* secret value rather than a reference.
+_SECRET_FIELD_NAMES = frozenset({
+    "password", "passwd", "passphrase", "secret", "secret_key", "api_key",
+    "apikey", "apisecret", "client_secret", "private_key", "privatekey",
+    "credential", "credentials", "access_token", "auth_token",
+})
+# Suffixes that mark a field as a reference/identifier, NOT a raw secret — these
+# are exempt from the field-name rule (e.g. auth_ref, content_hash, *_id).
+_ID_SUFFIXES = ("_ref", "_id", "_hash", "_fingerprint", "_name")
+
+
 def looks_like_secret(value: str) -> bool:
     """True if a string matches a known live-credential shape."""
     return any(p.search(value) for p in _SECRET_PATTERNS)
 
 
+def _is_secret_field(key: str) -> bool:
+    k = key.lower()
+    if k.endswith(_ID_SUFFIXES):
+        return False
+    return k in _SECRET_FIELD_NAMES
+
+
 def scan_for_secrets(obj: Any, path: str = "") -> Optional[str]:
-    """Return the dotted path of the first secret-looking value, or None."""
+    """Return the dotted path of the first secret the event must not carry, or
+    None. Flags (a) any string VALUE of a known credential shape, (b) any KEY of
+    a credential shape, and (c) a non-empty value under a field NAME that implies
+    a raw secret (password/secret/api_key/...), while exempting reference fields
+    (auth_ref, *_id, *_hash) that legitimately hold credential *ids*."""
     if isinstance(obj, str):
         return path if looks_like_secret(obj) else None
     if isinstance(obj, dict):
         for k, v in obj.items():
-            hit = scan_for_secrets(v, f"{path}.{k}" if path else str(k))
+            here = f"{path}.{k}" if path else str(k)
+            if isinstance(k, str) and looks_like_secret(k):
+                return f"{here}<key>"
+            if (isinstance(k, str) and _is_secret_field(k)
+                    and isinstance(v, str) and v.strip()):
+                return here
+            hit = scan_for_secrets(v, here)
             if hit:
                 return hit
     elif isinstance(obj, (list, tuple)):
@@ -115,30 +169,66 @@ def scan_for_secrets(obj: Any, path: str = "") -> Optional[str]:
 
 
 # --- canonicalization -------------------------------------------------------
-def _strip(obj: Any) -> Any:
-    """Explicit null policy: omit keys whose value is None (absent == null),
-    recursively. Everything else is passed through untouched."""
+def _canonical_obj(obj: Any) -> Any:
+    """Normalize a value for canonicalization so that ANY conforming serializer
+    reproduces identical bytes:
+
+      * strings are NFC-normalized (Unicode-equivalent strings can't diverge);
+      * dict keys must be strings (json would silently coerce True/1 -> "true"/
+        "1", colliding distinct events) and are NFC-normalized;
+      * None values are omitted (absent == null);
+      * floats are rejected (the spec is integers-only; NaN/Inf aren't even valid
+        JSON), so no serializer-dependent float formatting can leak in.
+
+    bool is intentionally preserved (JSON true/false is distinct from 1/0)."""
+    if obj is None or isinstance(obj, bool) or isinstance(obj, int):
+        return obj
+    if isinstance(obj, float):
+        raise ValueError("floats are not canonicalizable; use integers")
+    if isinstance(obj, str):
+        return unicodedata.normalize("NFC", obj)
     if isinstance(obj, dict):
-        return {k: _strip(v) for k, v in obj.items() if v is not None}
-    if isinstance(obj, list):
-        return [_strip(v) for v in obj]
-    return obj
+        out = {}
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise ValueError(f"non-string dict key {k!r} is not canonicalizable")
+            if v is None:
+                continue
+            out[unicodedata.normalize("NFC", k)] = _canonical_obj(v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_canonical_obj(v) for v in obj]
+    raise ValueError(f"uncanonicalizable type {type(obj).__name__}")
 
 
 def canonicalize(event: dict) -> bytes:
-    """Byte-stable canonical form of an event: signature excluded, nulls
-    omitted, keys sorted, no insignificant whitespace, UTF-8. Two callers that
-    build the same event (in any key order) get identical bytes."""
+    """Byte-stable canonical form of an event: signature excluded, nulls omitted,
+    NFC strings, string keys only, no floats, keys sorted, no insignificant
+    whitespace, ASCII-escaped. Two conforming serializers produce identical
+    bytes — the property the hash chain and any Tier-4 signature depend on."""
     body = {k: v for k, v in event.items() if k not in _UNSIGNED}
-    body = _strip(body)
+    body = _canonical_obj(body)
     return json.dumps(
-        body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
 
 
 def event_hash(event: dict) -> str:
     """sha256 of the canonical form, hex."""
     return hashlib.sha256(canonicalize(event)).hexdigest()
+
+
+def _validate_ts(ts: Any) -> None:
+    """A timestamp, if present, must be a timezone-aware ISO-8601 string — a
+    deadline without a zone is a wish."""
+    if not isinstance(ts, str):
+        raise ValueError(f"ts must be an ISO-8601 string: {ts!r}")
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        raise ValueError(f"ts must be ISO-8601: {ts!r}")
+    if dt.tzinfo is None:
+        raise ValueError(f"ts must be timezone-aware: {ts!r}")
 
 
 @dataclass
@@ -173,6 +263,8 @@ class CustodyLedger:
         kind."""
         if "kind" not in event:
             raise ValueError("event requires a 'kind'")
+        if event["kind"] not in _KINDS:
+            raise ValueError(f"unknown kind {event['kind']!r}")
         for r in _RESERVED:
             if r in event:
                 raise ValueError(f"caller may not set reserved field {r!r}")
@@ -187,7 +279,11 @@ class CustodyLedger:
         stored["ledger_prev_hash"] = self._head
         if ts is not None:
             stored["ts"] = ts
+        if "ts" in stored:
+            _validate_ts(stored["ts"])
 
+        # canonicalize() raises on an uncanonicalizable event (non-string key,
+        # float) BEFORE anything is appended — so those also fail closed.
         h = event_hash(stored)
         self._events.append(stored)
         self._head = h
@@ -225,13 +321,26 @@ class CustodyLedger:
 
     @classmethod
     def load(cls, path: str) -> "CustodyLedger":
-        """Rebuild a ledger from its JSONL file (for verify-after-reopen)."""
+        """Rebuild a ledger from its JSONL file and VERIFY it — fail closed. A
+        tampered or truncated file raises ChainError rather than loading as
+        valid; the file is data, not authority. (Tamper that re-derives the whole
+        chain is only caught once a Tier-4 checkpoint pins the head externally —
+        see the module docstring.)"""
         led = cls(path=None)
         with open(path, encoding="utf-8") as fh:
-            for line in fh:
+            for n, line in enumerate(fh, 1):
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     led._events.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise ChainError(f"corrupt ledger line {n}: {e}")
+        res = led.verify()
+        if not res.ok:
+            raise ChainError(
+                f"ledger failed verification on load: {res.reason} at seq {res.at_seq}"
+            )
         led._path = path
         led._head = event_hash(led._events[-1]) if led._events else GENESIS
         return led
@@ -273,7 +382,8 @@ def _declared_tools(declared: Any) -> list:
     tools = declared.get("tools", []) if isinstance(declared, dict) else declared
     if isinstance(tools, str):
         tools = re.split(r"[,\s]+", tools.strip())
-    return sorted({t for t in tools if t})
+    # Case-folded: capability comparison must not be evaded by "Write" vs "write".
+    return sorted({str(t).strip().lower() for t in tools if str(t).strip()})
 
 
 def session_check_in(ledger: CustodyLedger, session_id: str, actor: str,
@@ -311,10 +421,20 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
         if ev.get("session_id") != session_id:
             continue
         kind = ev.get("kind")
-        if kind == KIND_SESSION_CHECKIN and declared_header is None:
-            declared_header = ev.get("declared")
-        elif kind == KIND_SESSION_ACTION and ev.get("tool"):
-            observed.add(ev["tool"])
+        if kind == KIND_SESSION_CHECKOUT:
+            # idempotence: a session is reconciled once, or the ladder
+            # double-counts the same mismatch.
+            raise ChainError(f"session {session_id!r} already checked out")
+        if kind == KIND_SESSION_CHECKIN:
+            if declared_header is None:
+                declared_header = ev.get("declared")
+        elif kind == KIND_SESSION_ACTION:
+            # an untyped action still counts as a capability, so it can't hide.
+            observed.add(str(ev.get("tool") or "action").strip().lower())
+        elif kind in _CAPABILITY_BY_KIND:
+            # a write/egress routed through the file-custody path is folded too —
+            # this is the H5 evasion the auditor found.
+            observed.add(_CAPABILITY_BY_KIND[kind])
     if declared_header is None:
         raise ChainError(f"no session.checkin for session {session_id!r}")
 
@@ -349,6 +469,14 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
 # detect_capture_gap() writes a capture_gap. Detection is the value; it is not a
 # wall. (The actual wiring into a pre-tool hook / egress lane is cross-repo
 # Tier 3b; this is the standalone core those hooks call.)
+#
+# LAUNDERING LIMIT (honest): detect_capture_gap only fires when an honest
+# observer reports a hash BEFORE a write is recorded. An actor who controls the
+# write path can record an out-of-band edit as a normal file_write (auto-parent =
+# last recorded hash); verify_lineage passes and no gap is raised. This detects
+# accidents and honest reporting, not an adversary who owns the recorder — for
+# that you need the write path itself to run through the gate (Tier 3b) and the
+# H5 reconciliation to catch the undeclared capability.
 
 
 def _lineage_events(ledger: CustodyLedger, lineage_id: str) -> list:
@@ -377,44 +505,49 @@ def last_content_hash(ledger: CustodyLedger, lineage_id: str) -> Optional[str]:
 
 def file_create(ledger: CustodyLedger, lineage_id: str, actor: str,
                 content_hash: str, *, path: Optional[str] = None,
-                ts: Optional[str] = None) -> dict:
+                session_id: Optional[str] = None, ts: Optional[str] = None) -> dict:
     return ledger.append({
         "kind": KIND_FILE_CREATE, "lineage_id": lineage_id, "actor": actor,
-        "content_hash": content_hash, "path": path,
+        "content_hash": content_hash, "path": path, "session_id": session_id,
     }, ts=ts)
 
 
 def file_read(ledger: CustodyLedger, lineage_id: str, actor: str,
-              content_hash: str, *, ts: Optional[str] = None) -> dict:
+              content_hash: str, *, session_id: Optional[str] = None,
+              ts: Optional[str] = None) -> dict:
     return ledger.append({
         "kind": KIND_FILE_READ, "lineage_id": lineage_id, "actor": actor,
-        "content_hash": content_hash,
+        "content_hash": content_hash, "session_id": session_id,
     }, ts=ts)
 
 
 def file_write(ledger: CustodyLedger, lineage_id: str, actor: str,
                new_content_hash: str, *, parent_content_hash: Optional[str] = None,
-               diff_stat: Optional[dict] = None, ts: Optional[str] = None) -> dict:
+               diff_stat: Optional[dict] = None, session_id: Optional[str] = None,
+               ts: Optional[str] = None) -> dict:
     """Record a new version. If parent is not given it auto-chains to the last
-    recorded content hash for the lineage."""
+    recorded content hash for the lineage. Pass session_id to tie the write to a
+    session so H5 check-out reconciles it."""
     if parent_content_hash is None:
         parent_content_hash = last_content_hash(ledger, lineage_id)
     return ledger.append({
         "kind": KIND_FILE_WRITE, "lineage_id": lineage_id, "actor": actor,
         "content_hash": new_content_hash,
         "parent_content_hash": parent_content_hash,
-        "diff_stat": diff_stat,
+        "diff_stat": diff_stat, "session_id": session_id,
     }, ts=ts)
 
 
 def file_gate_cross(ledger: CustodyLedger, lineage_id: str, actor: str,
                     gate: dict, *, content_hash: Optional[str] = None,
+                    session_id: Optional[str] = None,
                     ts: Optional[str] = None) -> dict:
     """Record a file crossing an external gate (the received-file crossing). The
-    ledger's fail-closed redaction refuses a live secret carried in `gate`."""
+    ledger's fail-closed redaction refuses a live secret carried in `gate`. Pass
+    session_id so H5 reconciles the egress."""
     return ledger.append({
         "kind": KIND_FILE_GATE_CROSS, "lineage_id": lineage_id, "actor": actor,
-        "gate": gate, "content_hash": content_hash,
+        "gate": gate, "content_hash": content_hash, "session_id": session_id,
     }, ts=ts)
 
 
@@ -435,8 +568,15 @@ def verify_lineage(ledger: CustodyLedger, lineage_id: str) -> VerifyResult:
     content hash in effect before it. A documented capture_gap updates the
     effective hash, so legitimate writes still chain around an acknowledged
     break."""
+    evs = _lineage_events(ledger, lineage_id)
+    if not evs:
+        return VerifyResult(True, "ok")   # empty lineage: nothing to verify
+    # A lineage must have an origin — a create, or a gate-cross that received it.
+    # A write-first lineage is un-provenanced and must not pass.
+    if evs[0].get("kind") not in (KIND_FILE_CREATE, KIND_FILE_GATE_CROSS):
+        return VerifyResult(False, "lineage has no origin", evs[0].get("seq"))
     effective: Optional[str] = None
-    for e in _lineage_events(ledger, lineage_id):
+    for e in evs:
         if e.get("kind") == KIND_FILE_WRITE:
             if e.get("parent_content_hash") != effective:
                 return VerifyResult(False, "broken lineage chain", e.get("seq"))
