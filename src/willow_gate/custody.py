@@ -76,15 +76,21 @@ _KINDS = frozenset({
     KIND_SESSION_CHECKOUT, KIND_CAPTURE_GAP,
 })
 
+# Derived records the ledger concludes for itself — NOT receipts a caller may
+# supply. The public append() refuses them; only check_out()/detect_capture_gap()
+# emit them, so the party being judged cannot forge or pre-empt the judgement.
+_SYSTEM_KINDS = frozenset({KIND_SESSION_CHECKOUT, KIND_CAPTURE_GAP})
+
 # Which capability a session-tagged event exercises, for H5 reconciliation. A
 # capability recorded through ANY of these paths — not just session.action —
-# must be reconciled, or the check can be evaded by routing the write through the
-# file-custody path.
+# must be reconciled, or the check can be evaded by routing it through another
+# kind. file.checkout is a file LEAVING custody: an egress-class capability.
 _CAPABILITY_BY_KIND = {
     KIND_FILE_CREATE: "write",
     KIND_FILE_WRITE: "write",
     KIND_FILE_READ: "read",
     KIND_FILE_GATE_CROSS: "egress",
+    KIND_FILE_CHECKOUT: "egress",
 }
 
 # Fields the writer owns. A caller may not set these; the ledger assigns them.
@@ -119,10 +125,15 @@ _SECRET_PATTERNS = (
 
 
 # Field names that strongly imply a *raw* secret value rather than a reference.
+# Deliberately EXCLUDES the ambiguous generics `secret`/`credential`/`credentials`
+# — they false-positive on credential *ids* (a field literally named `credentials`
+# often holds an id). A plaintext secret under a bare `secret` field is caught only
+# if its value has a credential shape. Any field ending `_token` is also treated as
+# secret-bearing (session_token, auth_token, …); use `token_id`/`token_ref` for ids.
 _SECRET_FIELD_NAMES = frozenset({
-    "password", "passwd", "passphrase", "secret", "secret_key", "api_key",
-    "apikey", "apisecret", "client_secret", "private_key", "privatekey",
-    "credential", "credentials", "access_token", "auth_token",
+    "password", "passwd", "passphrase", "secret_key", "api_key", "apikey",
+    "apisecret", "client_secret", "private_key", "privatekey", "access_token",
+    "auth_token", "session_token", "token", "bearer", "cookie",
 })
 # Suffixes that mark a field as a reference/identifier, NOT a raw secret — these
 # are exempt from the field-name rule (e.g. auth_ref, content_hash, *_id).
@@ -138,15 +149,28 @@ def _is_secret_field(key: str) -> bool:
     k = key.lower()
     if k.endswith(_ID_SUFFIXES):
         return False
-    return k in _SECRET_FIELD_NAMES
+    return k in _SECRET_FIELD_NAMES or k.endswith("_token")
+
+
+def _has_string_leaf(v: Any) -> bool:
+    """True if v is, or contains anywhere, a non-empty string — so a secret can't
+    duck the field-name rule by hiding in a list or nested dict."""
+    if isinstance(v, str):
+        return bool(v.strip())
+    if isinstance(v, dict):
+        return any(_has_string_leaf(x) for x in v.values())
+    if isinstance(v, (list, tuple)):
+        return any(_has_string_leaf(x) for x in v)
+    return False
 
 
 def scan_for_secrets(obj: Any, path: str = "") -> Optional[str]:
     """Return the dotted path of the first secret the event must not carry, or
     None. Flags (a) any string VALUE of a known credential shape, (b) any KEY of
-    a credential shape, and (c) a non-empty value under a field NAME that implies
-    a raw secret (password/secret/api_key/...), while exempting reference fields
-    (auth_ref, *_id, *_hash) that legitimately hold credential *ids*."""
+    a credential shape, and (c) any non-empty string leaf — even wrapped in a
+    list/dict — under a field NAME that implies a raw secret, while exempting
+    reference fields (auth_ref, *_id, *_hash) that legitimately hold credential
+    *ids*."""
     if isinstance(obj, str):
         return path if looks_like_secret(obj) else None
     if isinstance(obj, dict):
@@ -154,8 +178,7 @@ def scan_for_secrets(obj: Any, path: str = "") -> Optional[str]:
             here = f"{path}.{k}" if path else str(k)
             if isinstance(k, str) and looks_like_secret(k):
                 return f"{here}<key>"
-            if (isinstance(k, str) and _is_secret_field(k)
-                    and isinstance(v, str) and v.strip()):
+            if isinstance(k, str) and _is_secret_field(k) and _has_string_leaf(v):
                 return here
             hit = scan_for_secrets(v, here)
             if hit:
@@ -261,6 +284,17 @@ class CustodyLedger:
         Raises SecretRefused (writing nothing) if any value looks like a live
         credential. Raises ValueError on a reserved-field collision or missing
         kind."""
+        if event.get("kind") in _SYSTEM_KINDS:
+            raise ValueError(
+                f"kind {event.get('kind')!r} is system-only — it is emitted by the "
+                f"ledger (check_out / detect_capture_gap), not appended by a caller"
+            )
+        return self._append(event, ts=ts)
+
+    def _append(self, event: dict, *, ts: Optional[str] = None) -> dict:
+        """The privileged writer. `append` is the caller-facing wrapper that adds
+        the system-only-kind guard; the ledger's own derived records go through
+        here directly."""
         if "kind" not in event:
             raise ValueError("event requires a 'kind'")
         if event["kind"] not in _KINDS:
@@ -268,6 +302,8 @@ class CustodyLedger:
         for r in _RESERVED:
             if r in event:
                 raise ValueError(f"caller may not set reserved field {r!r}")
+        if "sig" in event and not isinstance(event["sig"], str):
+            raise ValueError("sig must be a string")
 
         # Fail closed BEFORE any state changes: nothing is written on refusal.
         hit = scan_for_secrets(event)
@@ -285,11 +321,14 @@ class CustodyLedger:
         # canonicalize() raises on an uncanonicalizable event (non-string key,
         # float) BEFORE anything is appended — so those also fail closed.
         h = event_hash(stored)
+        # Persist BEFORE mutating memory, using the SAME ASCII policy as the hash,
+        # so a failed/unencodable write can never leave memory ahead of disk.
+        if self._path:
+            line = json.dumps(stored, ensure_ascii=True)
+            with open(self._path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
         self._events.append(stored)
         self._head = h
-        if self._path:
-            with open(self._path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(stored, ensure_ascii=False) + "\n")
         return dict(stored)
 
     # -- verification --------------------------------------------------------
@@ -341,6 +380,21 @@ class CustodyLedger:
             raise ChainError(
                 f"ledger failed verification on load: {res.reason} at seq {res.at_seq}"
             )
+        # Re-apply the live fail-closed gates — the file is data, not authority.
+        # A hand-built valid chain must not smuggle a secret, an illegal kind, or
+        # a bad ts that append() would have refused.
+        for ev in led._events:
+            seq = ev.get("seq")
+            if ev.get("kind") not in _KINDS:
+                raise ChainError(f"loaded event has illegal kind {ev.get('kind')!r} at seq {seq}")
+            if "ts" in ev:
+                try:
+                    _validate_ts(ev["ts"])
+                except ValueError as e:
+                    raise ChainError(f"loaded event has bad ts at seq {seq}: {e}")
+            hit = scan_for_secrets(ev)
+            if hit is not None:
+                raise ChainError(f"loaded event carries a secret at {hit!r} (seq {seq})")
         led._path = path
         led._head = event_hash(led._events[-1]) if led._events else GENESIS
         return led
@@ -382,6 +436,9 @@ def _declared_tools(declared: Any) -> list:
     tools = declared.get("tools", []) if isinstance(declared, dict) else declared
     if isinstance(tools, str):
         tools = re.split(r"[,\s]+", tools.strip())
+    if not isinstance(tools, (list, tuple, set)):
+        # fail closed on a malformed declared header, not with a bare TypeError.
+        raise ValueError(f"declared tools must be a list or string, got {type(tools).__name__}")
     # Case-folded: capability comparison must not be evaded by "Write" vs "write".
     return sorted({str(t).strip().lower() for t in tools if str(t).strip()})
 
@@ -415,28 +472,35 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
     """Reconcile a session's declared intent against its observed actions, append
     a durable session.checkout, and return the reconciliation. A capability
     exercised but not declared is a mismatch and a fail_count increment."""
+    # Idempotence is scoped to the CURRENT check-in window: each session.checkin
+    # opens a fresh instance (resetting observed + closed), and a checkout AFTER
+    # the latest checkin means already-closed. This closes double-counting without
+    # locking out a legitimately reused session_id. (session.checkout is system-
+    # only, so `closed` can only be set by an authoritative checkout — a caller
+    # can't forge one to deny reconciliation.)
     declared_header = None
     observed: set = set()
+    closed = False
     for ev in ledger.events():
         if ev.get("session_id") != session_id:
             continue
         kind = ev.get("kind")
-        if kind == KIND_SESSION_CHECKOUT:
-            # idempotence: a session is reconciled once, or the ladder
-            # double-counts the same mismatch.
-            raise ChainError(f"session {session_id!r} already checked out")
         if kind == KIND_SESSION_CHECKIN:
-            if declared_header is None:
-                declared_header = ev.get("declared")
+            declared_header = ev.get("declared")
+            observed = set()
+            closed = False
+        elif kind == KIND_SESSION_CHECKOUT:
+            closed = True
         elif kind == KIND_SESSION_ACTION:
             # an untyped action still counts as a capability, so it can't hide.
             observed.add(str(ev.get("tool") or "action").strip().lower())
         elif kind in _CAPABILITY_BY_KIND:
-            # a write/egress routed through the file-custody path is folded too —
-            # this is the H5 evasion the auditor found.
+            # a write/egress routed through the file-custody path is folded too.
             observed.add(_CAPABILITY_BY_KIND[kind])
     if declared_header is None:
         raise ChainError(f"no session.checkin for session {session_id!r}")
+    if closed:
+        raise ChainError(f"session {session_id!r} already checked out")
 
     declared = _declared_tools(declared_header)
     mismatches = sorted(observed - set(declared))
@@ -448,7 +512,7 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
         mismatches=mismatches,
         fail_count_delta=len(mismatches),
     )
-    ledger.append({
+    ledger._append({           # system-only kind — privileged path
         "kind": KIND_SESSION_CHECKOUT,
         "session_id": session_id,
         "reconciled": recon.reconciled,
@@ -552,9 +616,11 @@ def file_gate_cross(ledger: CustodyLedger, lineage_id: str, actor: str,
 
 
 def file_checkout(ledger: CustodyLedger, lineage_id: str, actor: str,
-                  *, ts: Optional[str] = None) -> dict:
+                  *, session_id: Optional[str] = None,
+                  ts: Optional[str] = None) -> dict:
     return ledger.append({
         "kind": KIND_FILE_CHECKOUT, "lineage_id": lineage_id, "actor": actor,
+        "session_id": session_id,
     }, ts=ts)
 
 
@@ -603,7 +669,7 @@ def detect_capture_gap(ledger: CustodyLedger, lineage_id: str,
     expected = last_content_hash(ledger, lineage_id)
     if expected is None or observed_content_hash == expected:
         return None
-    return ledger.append({
+    return ledger._append({    # system-only kind — privileged path
         "kind": KIND_CAPTURE_GAP, "lineage_id": lineage_id, "actor": actor,
         "expected_content_hash": expected,
         "observed_content_hash": observed_content_hash,

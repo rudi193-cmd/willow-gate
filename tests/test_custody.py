@@ -455,3 +455,125 @@ def test_tail_truncation_passes_tier1_verify_documented_limit():
         session_record_action(led, "s", "willow", t)
     led._events.pop()                       # drop the tail
     assert led.verify().ok is True          # KNOWN LIMIT: nothing pins the head at Tier 1
+
+
+# ============================================================================
+# Round-2 hardening — the re-audit findings (bypasses + new bugs)
+# ============================================================================
+from willow_gate.custody import file_checkout as _file_checkout  # noqa: E402
+
+
+def _write_valid_chain(path, events):
+    """Hand-build a self-consistent chain file (bypassing append's gates) to
+    simulate an attacker's crafted file."""
+    prev = GENESIS
+    lines = []
+    for i, e in enumerate(events):
+        ev = dict(e); ev["seq"] = i; ev["ledger_prev_hash"] = prev
+        prev = event_hash(ev)
+        lines.append(json.dumps(ev))
+    path.write_text("\n".join(lines) + "\n")
+
+
+# R2-1: system-only kinds cannot be appended by a caller (closes the forge).
+def test_system_only_kinds_refused_from_caller():
+    led = CustodyLedger()
+    for k in ("session.checkout", "capture_gap"):
+        with pytest.raises(ValueError):
+            led.append({"kind": k, "session_id": "s1", "actor": "x"})
+    assert len(led) == 0
+
+
+def test_forged_checkout_cannot_deny_reconciliation():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    session_record_action(led, "s1", "willow", "write")
+    with pytest.raises(ValueError):                      # forge blocked at the door
+        led.append({"kind": "session.checkout", "session_id": "s1", "reconciled": True})
+    recon = session_check_out(led, "s1")                 # real reconciliation still runs
+    assert recon.reconciled is False and "write" in recon.mismatches
+
+
+# R2-1: a reused session_id checks out again (no permanent lock-out).
+def test_session_id_reuse_reconciles_new_window():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    session_record_action(led, "s1", "willow", "read")
+    assert session_check_out(led, "s1").reconciled is True
+    # reuse the same id with a fresh check-in
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    session_record_action(led, "s1", "willow", "write")
+    r = session_check_out(led, "s1")
+    assert r.reconciled is False and r.mismatches == ["write"]
+
+
+# R2-2: load() re-runs ALL fail-closed gates, not just the chain.
+def test_load_rejects_smuggled_secret_kind_and_ts(tmp_path):
+    for events in (
+        [{"kind": "session.action", "actor": "x", "password": "hunter2"}],   # secret
+        [{"kind": "TOTALLY_BOGUS", "actor": "x"}],                            # illegal kind
+        [{"kind": "session.action", "actor": "x", "ts": "not-a-time"}],       # bad ts
+        [{"kind": "session.action", "actor": "x", "ts": 12345}],              # non-string ts
+    ):
+        p = tmp_path / "c.jsonl"
+        _write_valid_chain(p, events)
+        with pytest.raises(_ChainError):
+            CustodyLedger.load(str(p))
+
+
+# R2-3: wrapped-value secrets, field-name set fixes.
+def test_redaction_wrapped_value_secrets():
+    led = CustodyLedger()
+    for bad in ({"password": ["hunter2"]}, {"password": {"v": "hunter2"}}, {"api_key": ["letmein"]}):
+        with pytest.raises(SecretRefused):
+            led.append(dict(bad, kind="session.action", actor="x"))
+    assert len(led) == 0
+
+
+def test_redaction_no_false_positive_on_credential_ids():
+    led = CustodyLedger()
+    led.append({"kind": "session.action", "actor": "x", "credentials": "cred-7"})
+    led.append({"kind": "session.action", "actor": "x", "credential": "id-9"})
+    led.append({"kind": "session.action", "actor": "x", "token_id": "tok-1", "secret_ref": "s-1"})
+    assert led.verify().ok and len(led) == 3
+
+
+def test_redaction_new_credential_field_names():
+    led = CustodyLedger()
+    for bad in ({"bearer": "abc"}, {"cookie": "sessionid=abc"}, {"session_token": "abc"},
+                {"x_token": "abc"}, {"token": "abc"}):
+        with pytest.raises(SecretRefused):
+            led.append(dict(bad, kind="session.action", actor="x"))
+
+
+# R2-4: file.checkout is folded into H5; persist stays fail-closed; edges.
+def test_file_checkout_folds_into_h5():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    _file_checkout(led, "f", "willow", session_id="s1")
+    recon = session_check_out(led, "s1")
+    assert recon.reconciled is False and "egress" in recon.mismatches
+
+
+def test_persist_is_ascii_and_reloads(tmp_path):
+    p = tmp_path / "c.jsonl"
+    led = CustodyLedger(path=str(p))
+    led.append({"kind": "session.action", "actor": "willow", "tool": "café"}, ts="2026-07-11T00:00:00Z")
+    raw = p.read_bytes()
+    assert all(b < 128 for b in raw)                     # file uses the ASCII canonical policy
+    assert CustodyLedger.load(str(p)).verify().ok
+
+
+def test_declared_non_iterable_fails_closed():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", 5)             # malformed declared header
+    with pytest.raises(ValueError):
+        session_check_out(led, "s1")
+
+
+def test_sig_must_be_a_string():
+    led = CustodyLedger()
+    with pytest.raises(ValueError):
+        led.append({"kind": "session.action", "actor": "x", "sig": 123})
+    led.append({"kind": "session.action", "actor": "x", "sig": "deadbeef"})   # ok
+    assert led.verify().ok

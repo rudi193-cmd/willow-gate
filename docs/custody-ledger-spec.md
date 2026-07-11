@@ -67,14 +67,25 @@ One canonical JSON object per event. Fields:
 
 **Redaction is fail-closed** and refuses to persist an event carrying, anywhere in it, (a) a string
 **value** of a known live-credential shape (AWS/GitHub/Slack/Google/JWT/PEM), (b) a dict **key** of
-such a shape, or (c) a non-empty value under a field **name** that implies a raw secret
-(`password`/`secret`/`api_key`/`private_key`/…). Reference and identifier fields are **exempt** —
-`auth_ref`, `*_id`, `*_hash`, `*_fingerprint`, `*_name` — so a crossing is still recorded as *having
-happened, under which credential id*, never with the credential. It is deliberately **incomplete**
-(no generic-entropy heuristic, so a secret shaped like a content hash is indistinguishable from one
-and passes); it fails closed on what it recognizes — extend the patterns, never loosen the default.
-**Gate:** events carrying a live-looking token, a plaintext `password`/`api_key`, or a secret-shaped
-key are each rejected and write nothing; `auth_ref`/`*_id`/`*_hash` values pass.
+such a shape, or (c) **any non-empty string leaf — even wrapped in a list or nested dict** — under a
+field **name** that implies a raw secret (`password`/`api_key`/`private_key`/`client_secret`/
+`*_token`/`bearer`/`cookie`/…). Reference and identifier fields are **exempt** — `auth_ref`, `*_id`,
+`*_ref`, `*_hash`, `*_fingerprint`, `*_name` — so a crossing is still recorded as *having happened,
+under which credential id*, never with the credential. Ambiguous generic names (`secret`,
+`credential`, `credentials`) are deliberately **not** triggers: they false-positive on credential
+*ids*, so a plaintext secret under a bare `secret` field is caught only if its *value* has a
+credential shape. Redaction is deliberately **incomplete** (no generic-entropy heuristic — a secret
+shaped like a content hash is indistinguishable from one and passes); it fails closed on what it
+recognizes — extend the patterns, never loosen the default.
+**Gate:** a live token, a plaintext `password`/`api_key`/`bearer`, a list/dict-wrapped secret under
+a secret field, and a secret-shaped key are each rejected and write nothing; `auth_ref`/`*_id`/
+`*_hash` values and a legit `credentials: <id>` pass.
+
+**System-only kinds.** `session.checkout` and `capture_gap` are *derived* records — they are the
+ledger's own conclusions, not receipts a caller supplies. The public `append()` **refuses** them; only
+`check_out()` and `detect_capture_gap()` emit them, through a privileged internal path. Otherwise an
+agent could append its own `{"kind":"session.checkout","reconciled":true}` and either forge a clean
+record or deny the real reconciliation. A derived record must not be forgeable by the party it judges.
 
 ## Canonicalization (or the chain and the signatures mean nothing)
 
@@ -98,15 +109,18 @@ The deliverable H5 names. On session close:
 1. Read the `session.checkin` event's `declared` header (WillowGate 13 fields: declared tools,
    scopes, egress intent, trust level claimed).
 2. Fold **every** capability-bearing event tagged with this `session_id` into `observed` — not just
-   `session.action`: a `file.write`/`file.create` is a `write`, a `file.read` is a `read`, a
-   `file.gate_cross` is an `egress`, and an untyped `session.action` still counts (as `action`).
-   Folding only `session.action.tool` is an evasion — the write just routes through the file path.
-   Capability names are **case-folded** so `Write`/`write` can neither evade nor false-flag.
+   `session.action`: `file.write`/`file.create` is a `write`, `file.read` is a `read`,
+   `file.gate_cross`/`file.checkout` (a file leaving custody) is an `egress`, and an untyped
+   `session.action` still counts (as `action`). Folding only `session.action.tool` — or leaving any
+   capability kind out of the map — is an evasion; the write just routes through that path. Capability
+   names are **case-folded** so `Write`/`write` can neither evade nor false-flag.
 3. Diff `declared` vs `observed`. Any capability exercised but **not** declared → a
    reconciliation **mismatch**.
-4. Emit `session.checkout` with `{reconciled: bool, mismatches: [...], fail_count_delta}`. Feed
-   `fail_count` to the trust ladder; land the record where a human sees it. Check-out is
-   **idempotent** — a second `check_out` on a closed session is refused, or the ladder double-counts.
+4. Emit `session.checkout` (system-only) with `{reconciled, mismatches, fail_count_delta}`. Feed
+   `fail_count` to the trust ladder; land the record where a human sees it. Idempotence is scoped to
+   **the current check-in window** — a `session.checkout` *after the most recent* `session.checkin`
+   for this id means already-closed (refused, so the ladder can't double-count); a `session_id`
+   legitimately reused with a fresh check-in reconciles the new window rather than locking out.
 
 **Gate (H5's own):** an agent that check-in-declares `tools:[read]` then writes is caught at
 check-out with a reconciliation failure — whether the write is a `session.action`, a session-tagged
@@ -134,9 +148,11 @@ forgery or a tail-truncation is caught *only* by the checkpoint signature (see t
   chain `verify()` accepts — nor a tail-truncation. Nothing at Tier 1 pins the head. Only the
   **Tier-4 checkpoint signature** commits the head externally and makes those tamper-*evident*.
   Both limits are asserted by documented-limit tests so the boundary is pinned, not assumed.
-- **`load()` fails closed.** Re-opening a ledger from disk re-runs `verify()` and raises on a broken
-  chain or a corrupt line; the file is data, not authority. (It still cannot catch a fully
-  re-derived forgery without the Tier-4 head — same boundary as above.)
+- **`load()` fails closed on *every* invariant, not just the chain.** Re-opening a ledger re-runs
+  `verify()` (chain + seq) **and** re-applies the secret scan, the legal-kind check, and the tz-aware
+  `ts` check to every event, raising on any violation — otherwise a hand-built valid-chain file could
+  smuggle a secret, a bogus kind, or a bad `ts` that `append()` would have refused. The file is data,
+  not authority. (It still cannot catch a fully re-derived forgery without the Tier-4 head.)
 - **It witnesses; it does not prevent.** A file edited by a tool that emits no event is not
   blocked — it is *detected*: the next observed `content_hash` won't match the chained
   `parent_content_hash`, and a `capture_gap` event is written. Detection is the value (the
