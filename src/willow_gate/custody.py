@@ -338,3 +338,134 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
         "fail_count_delta": recon.fail_count_delta,
     }, ts=ts)
     return recon
+
+
+# --- Tier 3: file custody (lineage, diffs, capture-gap detection) ------------
+# Every file has a stable lineage_id that survives content changes; each version
+# links to its parent by content hash, so the whole life of a file is queryable
+# and diffable. The ledger WITNESSES, it does not PREVENT: an edit made by
+# something that emits no event is not blocked — it is DETECTED. The next
+# observed content hash will not match the last recorded one, and
+# detect_capture_gap() writes a capture_gap. Detection is the value; it is not a
+# wall. (The actual wiring into a pre-tool hook / egress lane is cross-repo
+# Tier 3b; this is the standalone core those hooks call.)
+
+
+def _lineage_events(ledger: CustodyLedger, lineage_id: str) -> list:
+    out = []
+    for e in ledger.events():
+        if e.get("lineage_id") != lineage_id:
+            continue
+        k = str(e.get("kind", ""))
+        if k.startswith("file.") or k == KIND_CAPTURE_GAP:
+            out.append(e)
+    return out
+
+
+def last_content_hash(ledger: CustodyLedger, lineage_id: str) -> Optional[str]:
+    """The content hash in effect for a lineage — from the last file event, or
+    the observed hash of a recorded capture_gap (a documented break becomes the
+    new baseline, so a gap is flagged once, not forever)."""
+    h = None
+    for e in _lineage_events(ledger, lineage_id):
+        if e.get("content_hash"):
+            h = e["content_hash"]
+        elif e.get("kind") == KIND_CAPTURE_GAP and e.get("observed_content_hash"):
+            h = e["observed_content_hash"]
+    return h
+
+
+def file_create(ledger: CustodyLedger, lineage_id: str, actor: str,
+                content_hash: str, *, path: Optional[str] = None,
+                ts: Optional[str] = None) -> dict:
+    return ledger.append({
+        "kind": KIND_FILE_CREATE, "lineage_id": lineage_id, "actor": actor,
+        "content_hash": content_hash, "path": path,
+    }, ts=ts)
+
+
+def file_read(ledger: CustodyLedger, lineage_id: str, actor: str,
+              content_hash: str, *, ts: Optional[str] = None) -> dict:
+    return ledger.append({
+        "kind": KIND_FILE_READ, "lineage_id": lineage_id, "actor": actor,
+        "content_hash": content_hash,
+    }, ts=ts)
+
+
+def file_write(ledger: CustodyLedger, lineage_id: str, actor: str,
+               new_content_hash: str, *, parent_content_hash: Optional[str] = None,
+               diff_stat: Optional[dict] = None, ts: Optional[str] = None) -> dict:
+    """Record a new version. If parent is not given it auto-chains to the last
+    recorded content hash for the lineage."""
+    if parent_content_hash is None:
+        parent_content_hash = last_content_hash(ledger, lineage_id)
+    return ledger.append({
+        "kind": KIND_FILE_WRITE, "lineage_id": lineage_id, "actor": actor,
+        "content_hash": new_content_hash,
+        "parent_content_hash": parent_content_hash,
+        "diff_stat": diff_stat,
+    }, ts=ts)
+
+
+def file_gate_cross(ledger: CustodyLedger, lineage_id: str, actor: str,
+                    gate: dict, *, content_hash: Optional[str] = None,
+                    ts: Optional[str] = None) -> dict:
+    """Record a file crossing an external gate (the received-file crossing). The
+    ledger's fail-closed redaction refuses a live secret carried in `gate`."""
+    return ledger.append({
+        "kind": KIND_FILE_GATE_CROSS, "lineage_id": lineage_id, "actor": actor,
+        "gate": gate, "content_hash": content_hash,
+    }, ts=ts)
+
+
+def file_checkout(ledger: CustodyLedger, lineage_id: str, actor: str,
+                  *, ts: Optional[str] = None) -> dict:
+    return ledger.append({
+        "kind": KIND_FILE_CHECKOUT, "lineage_id": lineage_id, "actor": actor,
+    }, ts=ts)
+
+
+def file_lineage(ledger: CustodyLedger, lineage_id: str) -> list:
+    """The full custody history of one file, in order — the custody view."""
+    return _lineage_events(ledger, lineage_id)
+
+
+def verify_lineage(ledger: CustodyLedger, lineage_id: str) -> VerifyResult:
+    """Check the version chain: each write's parent_content_hash matches the
+    content hash in effect before it. A documented capture_gap updates the
+    effective hash, so legitimate writes still chain around an acknowledged
+    break."""
+    effective: Optional[str] = None
+    for e in _lineage_events(ledger, lineage_id):
+        if e.get("kind") == KIND_FILE_WRITE:
+            if e.get("parent_content_hash") != effective:
+                return VerifyResult(False, "broken lineage chain", e.get("seq"))
+        if e.get("content_hash"):
+            effective = e["content_hash"]
+        elif e.get("kind") == KIND_CAPTURE_GAP and e.get("observed_content_hash"):
+            effective = e["observed_content_hash"]
+    return VerifyResult(True, "ok")
+
+
+def lineage_has_gaps(ledger: CustodyLedger, lineage_id: str) -> bool:
+    return any(e.get("kind") == KIND_CAPTURE_GAP
+               for e in _lineage_events(ledger, lineage_id))
+
+
+def detect_capture_gap(ledger: CustodyLedger, lineage_id: str,
+                       observed_content_hash: str, *, actor: str = "observer",
+                       ts: Optional[str] = None) -> Optional[dict]:
+    """Compare an observed file hash to the last recorded one. If they differ, no
+    recorded write explains the change (a write to `observed` would have moved the
+    recorded hash), so it is an out-of-band edit: append and return a capture_gap.
+    Returns None if consistent, or if there is no prior hash to compare against
+    (provenance-of-first-sight is H3's job, not this detector's)."""
+    expected = last_content_hash(ledger, lineage_id)
+    if expected is None or observed_content_hash == expected:
+        return None
+    return ledger.append({
+        "kind": KIND_CAPTURE_GAP, "lineage_id": lineage_id, "actor": actor,
+        "expected_content_hash": expected,
+        "observed_content_hash": observed_content_hash,
+        "note": "observed content hash has no explaining write event",
+    }, ts=ts)

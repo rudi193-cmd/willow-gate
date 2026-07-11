@@ -194,3 +194,99 @@ def test_declared_accepts_header_list_or_string():
     assert _declared_tools({"tools": "read, write"}) == ["read", "write"]
     assert _declared_tools(["write", "read", "read"]) == ["read", "write"]
     assert _declared_tools(None) == []
+
+
+# ============================================================================
+# Tier 3 — file custody (lineage, diffs, capture-gap detection)
+# ============================================================================
+import hashlib  # noqa: E402
+from willow_gate.custody import (  # noqa: E402
+    file_create, file_read, file_write, file_gate_cross, file_checkout,
+    file_lineage, verify_lineage, detect_capture_gap, lineage_has_gaps,
+    last_content_hash, KIND_CAPTURE_GAP, KIND_FILE_WRITE, KIND_FILE_CREATE,
+)
+
+
+def ch(s):  # a realistic content hash
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+# GATE: a file's full lineage is queryable start to finish, chain intact.
+def test_file_lineage_queryable_and_chained():
+    led = CustodyLedger()
+    file_create(led, "notes.md", "willow", ch("v1"), path="notes.md")
+    file_write(led, "notes.md", "willow", ch("v2"), diff_stat={"files": 1, "insertions": 3, "deletions": 0})
+    file_write(led, "notes.md", "willow", ch("v3"))
+    lin = file_lineage(led, "notes.md")
+    assert [e["kind"] for e in lin] == [KIND_FILE_CREATE, KIND_FILE_WRITE, KIND_FILE_WRITE]
+    # each version links to its parent by content hash
+    assert lin[1]["parent_content_hash"] == ch("v1")
+    assert lin[2]["parent_content_hash"] == ch("v2")
+    assert lin[1]["diff_stat"] == {"files": 1, "insertions": 3, "deletions": 0}
+    assert verify_lineage(led, "notes.md").ok
+    assert led.verify().ok
+    assert not lineage_has_gaps(led, "notes.md")
+
+
+def test_file_write_autochains_to_last_hash():
+    led = CustodyLedger()
+    file_create(led, "f", "willow", ch("v1"))
+    ev = file_write(led, "f", "willow", ch("v2"))          # no explicit parent
+    assert ev["parent_content_hash"] == ch("v1")
+    assert last_content_hash(led, "f") == ch("v2")
+
+
+# GATE: an out-of-band edit shows as a capture_gap.
+def test_out_of_band_edit_shows_as_capture_gap():
+    led = CustodyLedger()
+    file_create(led, "f", "willow", ch("v1"))
+    file_write(led, "f", "willow", ch("v2"))
+    # someone edits the file with no write event; we observe a new hash
+    gap = detect_capture_gap(led, "f", ch("v_external"))
+    assert gap is not None
+    assert gap["kind"] == KIND_CAPTURE_GAP
+    assert gap["expected_content_hash"] == ch("v2")
+    assert gap["observed_content_hash"] == ch("v_external")
+    assert led.events()[-1]["kind"] == KIND_CAPTURE_GAP    # durable
+    assert lineage_has_gaps(led, "f")
+    assert led.verify().ok                                 # the gap is a legit entry
+    # idempotent: re-observing the same hash does not re-flag
+    assert detect_capture_gap(led, "f", ch("v_external")) is None
+    # and a legitimate write chains from the acknowledged break
+    ev = file_write(led, "f", "willow", ch("v_next"))
+    assert ev["parent_content_hash"] == ch("v_external")
+    assert verify_lineage(led, "f").ok
+
+
+def test_capture_gap_none_when_consistent():
+    led = CustodyLedger()
+    file_create(led, "f", "willow", ch("v1"))
+    file_write(led, "f", "willow", ch("v2"))
+    before = len(led)
+    assert detect_capture_gap(led, "f", ch("v2")) is None   # matches last recorded
+    assert len(led) == before                               # nothing written
+
+
+def test_lineages_are_independent():
+    led = CustodyLedger()
+    file_create(led, "a", "willow", ch("a1"))
+    file_create(led, "b", "hanuman", ch("b1"))
+    file_write(led, "a", "willow", ch("a2"))
+    assert last_content_hash(led, "a") == ch("a2")
+    assert last_content_hash(led, "b") == ch("b1")
+    assert [e["kind"] for e in file_lineage(led, "b")] == [KIND_FILE_CREATE]
+
+
+# GATE: a gate crossing carrying a live secret is refused (fail-closed).
+def test_file_gate_cross_redacts_live_secret():
+    led = CustodyLedger()
+    file_create(led, "f", "willow", ch("v1"))
+    with pytest.raises(SecretRefused):
+        file_gate_cross(led, "f", "willow",
+                        {"name": "github", "auth_ref": "github_pat_" + "b" * 30})
+    # a crossing recorded under a credential *id* is fine
+    ev = file_gate_cross(led, "f", "willow",
+                         {"name": "jeles", "auth_ref": "cred-7", "direction": "in"},
+                         content_hash=ch("received"))
+    assert ev["gate"]["auth_ref"] == "cred-7"
+    assert led.verify().ok
