@@ -545,15 +545,15 @@ def test_redaction_no_false_positive_on_credential_ids():
 
 
 def test_redaction_high_signal_credential_field_names():
-    # R3-3 narrowed the set: keep the high-signal explicit names...
+    # High-signal names AND any *_token (R4-2 restored the suffix) are refused...
     led = CustodyLedger()
-    for bad in ({"bearer": "abc"}, {"session_token": "abc"}, {"access_token": "abc"}):
+    for bad in ({"bearer": "abc"}, {"session_token": "abc"}, {"access_token": "abc"},
+                {"x_token": "abc"}):
         with pytest.raises(SecretRefused):
             led.append(dict(bad, kind="session.action", actor="x"))
-    # ...and DROP the ambiguous ones that false-positived (bare token/cookie, *_token suffix)
+    # ...while the bare `token`/`cookie` names remain non-triggers (too ambiguous).
     led.append({"kind": "session.action", "actor": "x", "token": "issue-1"})
     led.append({"kind": "session.action", "actor": "x", "cookie": "theme=dark"})
-    led.append({"kind": "session.action", "actor": "x", "x_token": "abc"})
     assert led.verify().ok
 
 
@@ -670,3 +670,93 @@ def test_load_raises_chainerror_on_float_and_bad_sig(tmp_path):
     _write_valid_chain(p2, [{"kind": "session.action", "actor": "x", "sig": 123}])
     with pytest.raises(_ChainError):
         CustodyLedger.load(str(p2))
+
+
+# ============================================================================
+# Round-4 — pass-4 findings (Tier-2 fixes + documented Tier-4-boundary limits)
+# ============================================================================
+from willow_gate.custody import (  # noqa: E402
+    verify_lineage as _verify_lineage, KIND_FILE_CREATE as _FC,
+)
+
+
+# R4-1 (F3): a capability exercised BEFORE the first check-in is still caught.
+def test_pre_checkin_action_is_folded():
+    led = CustodyLedger()
+    session_record_action(led, "s1", "willow", "write")     # capability first
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})   # then narrow declaration
+    r = session_check_out(led, "s1")
+    assert r.reconciled is False and r.mismatches == ["write"]
+
+
+# R4-2 (F2): *_token fields are secret-bearing except the pagination allowlist.
+def test_star_token_secrets_caught_cursors_allowed():
+    led = CustodyLedger()
+    for bad in ({"refresh_token": "1//0opaque"}, {"id_token": "opaque"}, {"csrf_token": "opaque"}):
+        with pytest.raises(SecretRefused):
+            led.append(dict(bad, kind="session.action", actor="x"))
+    # pagination cursors that end in _token are allowed
+    for ok in ({"next_token": "page2"}, {"page_token": "p"}, {"continuation_token": "c"}):
+        led.append(dict(ok, kind="session.action", actor="x"))
+    assert led.verify().ok
+
+
+# R4-3 (F6): an untagged capability event is not attributable — DOCUMENTED LIMIT.
+def test_untagged_capability_not_reconciled_documented_limit():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    _file_checkout(led, "f", "willow", session_id=None)     # no session tag
+    r = session_check_out(led, "s1")
+    # KNOWN LIMIT: reconciliation can't attribute an untagged event; the Tier-3b
+    # hook must inject session_id. Asserted so the boundary is explicit.
+    assert r.reconciled is True and r.mismatches == []
+
+
+# R4-4 (F1): forged checkout+checkin in a loaded file MASKS — DOCUMENTED LIMIT.
+def test_forged_checkout_checkin_masks_documented_limit(tmp_path):
+    p = tmp_path / "c.jsonl"
+    _write_valid_chain(p, [
+        {"kind": "session.checkin", "session_id": "s1", "actor": "w", "declared": {"tools": ["read"]}},
+        {"kind": "session.action", "session_id": "s1", "actor": "w", "tool": "write"},   # undeclared
+        {"kind": "session.checkout", "session_id": "s1", "actor": "w", "reconciled": True, "mismatches": []},
+        {"kind": "session.checkin", "session_id": "s1", "actor": "w", "declared": {"tools": ["read"]}},
+    ])
+    led = CustodyLedger.load(str(p))
+    r = session_check_out(led, "s1")
+    # KNOWN LIMIT (Tier-4): the forged pair rolls the window forward; the real
+    # write is masked. Only the signed head can authenticate the derived records.
+    assert r.reconciled is True and r.mismatches == []
+
+
+# R4-4 (F4): a forged checkout spoofs already_closed on a genuine mismatch — LIMIT.
+def test_forged_checkout_spoofs_already_closed_documented_limit(tmp_path):
+    p = tmp_path / "c.jsonl"
+    _write_valid_chain(p, [
+        {"kind": "session.checkin", "session_id": "s1", "actor": "w", "declared": {"tools": ["read"]}},
+        {"kind": "session.action", "session_id": "s1", "actor": "w", "tool": "write"},
+        {"kind": "session.checkout", "session_id": "s1", "actor": "w", "reconciled": True, "mismatches": []},
+    ])
+    led = CustodyLedger.load(str(p))
+    r = session_check_out(led, "s1")
+    # recon VALUES are still true (round-3 win) ...
+    assert r.reconciled is False and r.mismatches == ["write"]
+    # ... but already_closed is spoofed True by the forgery — a consumer honoring
+    # it would skip the real ladder feed. KNOWN LIMIT until Tier-4.
+    assert r.already_closed is True
+
+
+# R4-4 (F5): a forged capture_gap launders a lineage — DOCUMENTED LIMIT.
+def test_forged_capture_gap_launders_lineage_documented_limit(tmp_path):
+    p = tmp_path / "c.jsonl"
+    Z = _ch("attacker-content")
+    _write_valid_chain(p, [
+        {"kind": _FC, "lineage_id": "f", "actor": "w", "content_hash": _ch("v1")},
+        {"kind": KIND_CAPTURE_GAP, "lineage_id": "f", "actor": "w",
+         "expected_content_hash": _ch("v1"), "observed_content_hash": Z},
+        {"kind": KIND_FILE_WRITE, "lineage_id": "f", "actor": "w",
+         "content_hash": _ch("v2"), "parent_content_hash": Z},
+    ])
+    led = CustodyLedger.load(str(p))
+    # KNOWN LIMIT (Tier-4): a write parented on attacker content Z chains cleanly
+    # because the forged capture_gap made Z the baseline.
+    assert _verify_lineage(led, "f").ok is True

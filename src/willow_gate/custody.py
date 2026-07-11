@@ -145,13 +145,23 @@ def looks_like_secret(value: str) -> bool:
     return any(p.search(value) for p in _SECRET_PATTERNS)
 
 
+# Pagination cursors etc. that end in `_token` but are NOT secrets — exempt from
+# the `*_token` rule so they don't false-positive.
+_BENIGN_TOKEN_FIELDS = frozenset({
+    "next_token", "page_token", "next_page_token", "continuation_token",
+})
+
+
 def _is_secret_field(key: str) -> bool:
     k = key.lower()
     if k.endswith(_ID_SUFFIXES):
         return False
-    # NOTE: no bare `token`/`cookie` and no `*_token` suffix — they false-positive
-    # on pagination cursors (next_token) and UI cookies. Only explicit names.
-    return k in _SECRET_FIELD_NAMES
+    if k in _SECRET_FIELD_NAMES:
+        return True
+    # Any `*_token` field is secret-bearing (refresh_token, id_token, csrf_token,
+    # access_token, …) EXCEPT the pagination-cursor allowlist. The bare `token`
+    # and `cookie` names remain non-triggers (they false-positive too broadly).
+    return k.endswith("_token") and k not in _BENIGN_TOKEN_FIELDS
 
 
 def _has_string_leaf(v: Any) -> bool:
@@ -492,7 +502,13 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
             continue
         kind = ev.get("kind")
         if kind == KIND_SESSION_CHECKIN:
-            if closed or declared_header is None:
+            if declared_header is None:
+                # first check-in: adopt the declaration but KEEP any pre-check-in
+                # actions in `observed` — a capability exercised and then narrowly
+                # declared must still be caught (F3).
+                declared_header = ev.get("declared")
+            elif closed:
+                # a genuinely fresh window after a check-out: reset.
                 declared_header = ev.get("declared")
                 observed = set()
                 closed = False
@@ -519,11 +535,13 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
         fail_count_delta=len(mismatches),
         already_closed=closed,
     )
-    # Recompute-don't-raise: if this window already had a checkout (possibly a
-    # forgery in a loaded file — load() can't run the system-only guard), return
-    # the TRUE reconciliation without a duplicate emit, so the forgery can neither
-    # DENY the real reconciliation nor MASK a mismatch. Authenticating the checkout
-    # record itself is a Tier-4 (signature) property, not achievable here.
+    # Recompute-don't-raise: return the TRUE reconciliation without a duplicate
+    # emit. This defeats a LONE forged session.checkout in a loaded file — it can
+    # neither deny nor mask. It does NOT close forgery in general: a forged
+    # checkout+checkin PAIR can still roll the window forward and mask a mismatch,
+    # and a forged checkout can spoof `already_closed`. Authenticating derived
+    # records against a file-writing adversary is a Tier-4 (signed-head) property,
+    # not achievable here — see docs/custody-ledger-spec.md "The Tier-4 boundary".
     if not closed:
         ledger._append({           # system-only kind — privileged path
             "kind": KIND_SESSION_CHECKOUT,

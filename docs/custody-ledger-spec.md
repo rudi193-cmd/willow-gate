@@ -69,9 +69,11 @@ One canonical JSON object per event. Fields:
 **value** of a known live-credential shape (AWS/GitHub/Slack/Google/JWT/PEM), (b) a dict **key** of
 such a shape, or (c) **any non-empty string leaf — even wrapped in a list or nested dict** — under a
 field **name** that implies a raw secret (`password`/`api_key`/`private_key`/`client_secret`/
-`session_token`/`access_token`/`bearer`/…). The bare `token`/`cookie` names and a `*_token` suffix
-are **not** triggers — they false-positive on pagination cursors (`next_token`) and UI cookies.
-Reference and identifier fields are **exempt** — `auth_ref`, `*_id`,
+`session_token`/`access_token`/`refresh_token`/`id_token`/`bearer`/… **and any `*_token` field**). A
+small allowlist of pagination cursors (`next_token`, `page_token`, `next_page_token`,
+`continuation_token`) is exempt from the `*_token` rule, and the bare `token`/`cookie` names are not
+triggers — they false-positive on cursors and UI cookies. Reference and identifier fields are
+**exempt** — `auth_ref`, `*_id`,
 `*_ref`, `*_hash`, `*_fingerprint`, `*_name` — so a crossing is still recorded as *having happened,
 under which credential id*, never with the credential. Ambiguous generic names (`secret`,
 `credential`, `credentials`) are deliberately **not** triggers: they false-positive on credential
@@ -122,17 +124,28 @@ The deliverable H5 names. On session close:
 4. Emit `session.checkout` (system-only) with `{reconciled, mismatches, fail_count_delta}`. Feed
    `fail_count` to the trust ladder; land the record where a human sees it.
 
-**Windowing & idempotence (Tier-4 boundary).** A fresh window opens **only on a check-in that
-follows a check-out**; a *re-check-in inside an open window is ignored* — it can neither reset
-`observed` (else an agent double-checks-in to erase an undeclared capability) nor re-broaden
-`declared`. `check_out` **never raises** on an already-closed window: it recomputes the true
-reconciliation from the window's actions and returns it (flagging `already_closed`, skipping a
-duplicate emit so the ladder can't double-count). This is deliberate — because `load()` cannot
-re-run the system-only guard, a hand-written valid-chain file could contain a forged
-`session.checkout`; recompute-don't-raise means that forgery can neither **deny** the real
-reconciliation nor **mask** a mismatch. What it *cannot* do at this tier is prove the checkout
-record is authentic — **that is a Tier-4 property** (the signed head authenticates which records are
-the ledger's own). At Tier 2, treat a `session.checkout` in an untrusted file as unauthenticated.
+**Windowing & idempotence.** Actions before the first check-in fold into the first window (a
+capability exercised and *then* narrowly declared is still caught). A *fresh* window opens **only on
+a check-in that follows a check-out**; a re-check-in inside an open window is ignored — it can
+neither reset `observed` nor re-broaden `declared`. `check_out` **never raises** on an already-closed
+window: it recomputes the true reconciliation from the window's actions and returns it (flagging
+`already_closed`, skipping a duplicate emit).
+
+**The Tier-4 boundary (stated honestly — the docs must not lie).** `check_out`'s recompute-don't-raise
+defeats a *lone* forged `session.checkout`: it can neither deny nor mask. It does **not** fully close
+forgery, and an earlier draft of this spec wrongly claimed it did. Because `load()` cannot re-run the
+system-only guard (or no genuine saved record could reload), a file-writing adversary can still,
+against a *loaded* ledger:
+  * **mask a mismatch** with a forged `session.checkout` **followed by** a forged `session.checkin`
+    — the pair rolls the window forward and drops the real window's actions;
+  * **suppress the ladder feed** by spoofing `already_closed=True` on the first genuine check-out —
+    so `already_closed` is *advisory*, not trustworthy against a tampered file;
+  * **launder a lineage** with a forged `capture_gap` that a later `file.write` then chains onto.
+None of these is fixable at this tier: authenticating *which derived records are the ledger's own*
+against a party who can rewrite the file is exactly what the **Tier-4 signed head** provides. Until
+Tier 4, treat every `session.checkout`/`capture_gap` in an untrusted file as **unauthenticated**, and
+rely on H5 only for a ledger you wrote yourself in-process. Documented-limit tests assert each of
+these, so the boundary is pinned, not assumed.
 
 **Gate (H5's own):** an agent that check-in-declares `tools:[read]` then writes is caught at
 check-out with a reconciliation failure — whether the write is a `session.action`, a session-tagged
@@ -174,6 +187,11 @@ forgery or a tail-truncation is caught *only* by the checkpoint signature (see t
   path can launder an out-of-band edit as a normal `file_write` and no gap is raised — that case is
   caught (if at all) by routing the write through the gate (Tier 3b) and by H5 reconciliation, not
   by the detector. A lineage with no origin (`file.create`/`file.gate_cross` first) does not verify.
+- **A capability event with no `session_id` is not reconciled.** H5 can only fold events tagged with
+  the session; an untagged `file.checkout`/`file.write`/etc. is unattributable and escapes the
+  check. This is the **Tier-3b hook's duty**: it must inject the *active* `session_id` on every
+  capability event, so a raw untagged call is outside reconciliation by construction, not a gap the
+  core can close alone.
 - **Completeness = capture points.** The ledger is only as complete as the hooks that feed it.
   Every unexplained hash jump must surface as `capture_gap` — silence must never read as "nothing
   happened."
