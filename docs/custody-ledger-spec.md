@@ -69,7 +69,9 @@ One canonical JSON object per event. Fields:
 **value** of a known live-credential shape (AWS/GitHub/Slack/Google/JWT/PEM), (b) a dict **key** of
 such a shape, or (c) **any non-empty string leaf — even wrapped in a list or nested dict** — under a
 field **name** that implies a raw secret (`password`/`api_key`/`private_key`/`client_secret`/
-`*_token`/`bearer`/`cookie`/…). Reference and identifier fields are **exempt** — `auth_ref`, `*_id`,
+`session_token`/`access_token`/`bearer`/…). The bare `token`/`cookie` names and a `*_token` suffix
+are **not** triggers — they false-positive on pagination cursors (`next_token`) and UI cookies.
+Reference and identifier fields are **exempt** — `auth_ref`, `*_id`,
 `*_ref`, `*_hash`, `*_fingerprint`, `*_name` — so a crossing is still recorded as *having happened,
 under which credential id*, never with the credential. Ambiguous generic names (`secret`,
 `credential`, `credentials`) are deliberately **not** triggers: they false-positive on credential
@@ -110,17 +112,27 @@ The deliverable H5 names. On session close:
    scopes, egress intent, trust level claimed).
 2. Fold **every** capability-bearing event tagged with this `session_id` into `observed` — not just
    `session.action`: `file.write`/`file.create` is a `write`, `file.read` is a `read`,
-   `file.gate_cross`/`file.checkout` (a file leaving custody) is an `egress`, and an untyped
-   `session.action` still counts (as `action`). Folding only `session.action.tool` — or leaving any
-   capability kind out of the map — is an evasion; the write just routes through that path. Capability
-   names are **case-folded** so `Write`/`write` can neither evade nor false-flag.
+   `file.gate_cross` is an `egress`, `file.checkout` (a file leaving custody) is its **own**
+   `checkout` capability — *not* folded into `egress`, or declaring one would excuse the other — and
+   an untyped `session.action` still counts (as `action`). Folding only `session.action.tool` — or
+   leaving any capability kind out of the map — is an evasion; the write just routes through that
+   path. Capability names are **case-folded** so `Write`/`write` can neither evade nor false-flag.
 3. Diff `declared` vs `observed`. Any capability exercised but **not** declared → a
    reconciliation **mismatch**.
 4. Emit `session.checkout` (system-only) with `{reconciled, mismatches, fail_count_delta}`. Feed
-   `fail_count` to the trust ladder; land the record where a human sees it. Idempotence is scoped to
-   **the current check-in window** — a `session.checkout` *after the most recent* `session.checkin`
-   for this id means already-closed (refused, so the ladder can't double-count); a `session_id`
-   legitimately reused with a fresh check-in reconciles the new window rather than locking out.
+   `fail_count` to the trust ladder; land the record where a human sees it.
+
+**Windowing & idempotence (Tier-4 boundary).** A fresh window opens **only on a check-in that
+follows a check-out**; a *re-check-in inside an open window is ignored* — it can neither reset
+`observed` (else an agent double-checks-in to erase an undeclared capability) nor re-broaden
+`declared`. `check_out` **never raises** on an already-closed window: it recomputes the true
+reconciliation from the window's actions and returns it (flagging `already_closed`, skipping a
+duplicate emit so the ladder can't double-count). This is deliberate — because `load()` cannot
+re-run the system-only guard, a hand-written valid-chain file could contain a forged
+`session.checkout`; recompute-don't-raise means that forgery can neither **deny** the real
+reconciliation nor **mask** a mismatch. What it *cannot* do at this tier is prove the checkout
+record is authentic — **that is a Tier-4 property** (the signed head authenticates which records are
+the ledger's own). At Tier 2, treat a `session.checkout` in an untrusted file as unauthenticated.
 
 **Gate (H5's own):** an agent that check-in-declares `tools:[read]` then writes is caught at
 check-out with a reconciliation failure — whether the write is a `session.action`, a session-tagged

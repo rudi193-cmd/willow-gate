@@ -90,7 +90,7 @@ _CAPABILITY_BY_KIND = {
     KIND_FILE_WRITE: "write",
     KIND_FILE_READ: "read",
     KIND_FILE_GATE_CROSS: "egress",
-    KIND_FILE_CHECKOUT: "egress",
+    KIND_FILE_CHECKOUT: "checkout",   # distinct: declaring egress must not excuse a checkout
 }
 
 # Fields the writer owns. A caller may not set these; the ledger assigns them.
@@ -133,7 +133,7 @@ _SECRET_PATTERNS = (
 _SECRET_FIELD_NAMES = frozenset({
     "password", "passwd", "passphrase", "secret_key", "api_key", "apikey",
     "apisecret", "client_secret", "private_key", "privatekey", "access_token",
-    "auth_token", "session_token", "token", "bearer", "cookie",
+    "auth_token", "session_token", "bearer",
 })
 # Suffixes that mark a field as a reference/identifier, NOT a raw secret — these
 # are exempt from the field-name rule (e.g. auth_ref, content_hash, *_id).
@@ -149,7 +149,9 @@ def _is_secret_field(key: str) -> bool:
     k = key.lower()
     if k.endswith(_ID_SUFFIXES):
         return False
-    return k in _SECRET_FIELD_NAMES or k.endswith("_token")
+    # NOTE: no bare `token`/`cookie` and no `*_token` suffix — they false-positive
+    # on pagination cursors (next_token) and UI cookies. Only explicit names.
+    return k in _SECRET_FIELD_NAMES
 
 
 def _has_string_leaf(v: Any) -> bool:
@@ -172,14 +174,14 @@ def scan_for_secrets(obj: Any, path: str = "") -> Optional[str]:
     reference fields (auth_ref, *_id, *_hash) that legitimately hold credential
     *ids*."""
     if isinstance(obj, str):
-        return path if looks_like_secret(obj) else None
+        return f"{path} (credential-shaped value)" if looks_like_secret(obj) else None
     if isinstance(obj, dict):
         for k, v in obj.items():
             here = f"{path}.{k}" if path else str(k)
             if isinstance(k, str) and looks_like_secret(k):
-                return f"{here}<key>"
+                return f"{here} (credential-shaped key)"
             if isinstance(k, str) and _is_secret_field(k) and _has_string_leaf(v):
-                return here
+                return f"{here} (secret-implying field name)"
             hit = scan_for_secrets(v, here)
             if hit:
                 return hit
@@ -308,7 +310,7 @@ class CustodyLedger:
         # Fail closed BEFORE any state changes: nothing is written on refusal.
         hit = scan_for_secrets(event)
         if hit is not None:
-            raise SecretRefused(f"value at {hit!r} looks like a live secret")
+            raise SecretRefused(f"possible secret refused at {hit}")
 
         stored = dict(event)
         stored["seq"] = len(self._events)
@@ -375,18 +377,23 @@ class CustodyLedger:
                     led._events.append(json.loads(line))
                 except json.JSONDecodeError as e:
                     raise ChainError(f"corrupt ledger line {n}: {e}")
-        res = led.verify()
+        try:
+            res = led.verify()
+        except ValueError as e:   # an uncanonicalizable loaded leaf (float, bad key)
+            raise ChainError(f"ledger has an uncanonicalizable event on load: {e}")
         if not res.ok:
             raise ChainError(
                 f"ledger failed verification on load: {res.reason} at seq {res.at_seq}"
             )
         # Re-apply the live fail-closed gates — the file is data, not authority.
-        # A hand-built valid chain must not smuggle a secret, an illegal kind, or
-        # a bad ts that append() would have refused.
+        # A hand-built valid chain must not smuggle a secret, an illegal kind, a
+        # bad ts, or a non-string sig that append() would have refused.
         for ev in led._events:
             seq = ev.get("seq")
             if ev.get("kind") not in _KINDS:
                 raise ChainError(f"loaded event has illegal kind {ev.get('kind')!r} at seq {seq}")
+            if "sig" in ev and not isinstance(ev["sig"], str):
+                raise ChainError(f"loaded event has non-string sig at seq {seq}")
             if "ts" in ev:
                 try:
                     _validate_ts(ev["ts"])
@@ -394,7 +401,7 @@ class CustodyLedger:
                     raise ChainError(f"loaded event has bad ts at seq {seq}: {e}")
             hit = scan_for_secrets(ev)
             if hit is not None:
-                raise ChainError(f"loaded event carries a secret at {hit!r} (seq {seq})")
+                raise ChainError(f"loaded event carries a secret at {hit} (seq {seq})")
         led._path = path
         led._head = event_hash(led._events[-1]) if led._events else GENESIS
         return led
@@ -418,6 +425,7 @@ class Reconciliation:
     observed: list
     mismatches: list
     fail_count_delta: int
+    already_closed: bool = False   # this window already had a checkout; do not re-feed the ladder
 
     def __bool__(self) -> bool:
         return self.reconciled
@@ -472,12 +480,10 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
     """Reconcile a session's declared intent against its observed actions, append
     a durable session.checkout, and return the reconciliation. A capability
     exercised but not declared is a mismatch and a fail_count increment."""
-    # Idempotence is scoped to the CURRENT check-in window: each session.checkin
-    # opens a fresh instance (resetting observed + closed), and a checkout AFTER
-    # the latest checkin means already-closed. This closes double-counting without
-    # locking out a legitimately reused session_id. (session.checkout is system-
-    # only, so `closed` can only be set by an authoritative checkout — a caller
-    # can't forge one to deny reconciliation.)
+    # A window opens ONLY on a check-in that follows a check-out. A re-check-in
+    # inside an OPEN window is ignored — it may not reset `observed` (else an
+    # agent double-checks-in to erase an undeclared capability) nor re-broaden
+    # `declared`. `closed` = the current window already has a checkout.
     declared_header = None
     observed: set = set()
     closed = False
@@ -486,21 +492,21 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
             continue
         kind = ev.get("kind")
         if kind == KIND_SESSION_CHECKIN:
-            declared_header = ev.get("declared")
-            observed = set()
-            closed = False
+            if closed or declared_header is None:
+                declared_header = ev.get("declared")
+                observed = set()
+                closed = False
+            # else: re-check-in in an open window -> ignored on purpose.
         elif kind == KIND_SESSION_CHECKOUT:
             closed = True
         elif kind == KIND_SESSION_ACTION:
             # an untyped action still counts as a capability, so it can't hide.
             observed.add(str(ev.get("tool") or "action").strip().lower())
         elif kind in _CAPABILITY_BY_KIND:
-            # a write/egress routed through the file-custody path is folded too.
+            # a write/egress/checkout routed through the file path is folded too.
             observed.add(_CAPABILITY_BY_KIND[kind])
     if declared_header is None:
         raise ChainError(f"no session.checkin for session {session_id!r}")
-    if closed:
-        raise ChainError(f"session {session_id!r} already checked out")
 
     declared = _declared_tools(declared_header)
     mismatches = sorted(observed - set(declared))
@@ -511,16 +517,23 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
         observed=sorted(observed),
         mismatches=mismatches,
         fail_count_delta=len(mismatches),
+        already_closed=closed,
     )
-    ledger._append({           # system-only kind — privileged path
-        "kind": KIND_SESSION_CHECKOUT,
-        "session_id": session_id,
-        "reconciled": recon.reconciled,
-        "declared": recon.declared,
-        "observed": recon.observed,
-        "mismatches": recon.mismatches,
-        "fail_count_delta": recon.fail_count_delta,
-    }, ts=ts)
+    # Recompute-don't-raise: if this window already had a checkout (possibly a
+    # forgery in a loaded file — load() can't run the system-only guard), return
+    # the TRUE reconciliation without a duplicate emit, so the forgery can neither
+    # DENY the real reconciliation nor MASK a mismatch. Authenticating the checkout
+    # record itself is a Tier-4 (signature) property, not achievable here.
+    if not closed:
+        ledger._append({           # system-only kind — privileged path
+            "kind": KIND_SESSION_CHECKOUT,
+            "session_id": session_id,
+            "reconciled": recon.reconciled,
+            "declared": recon.declared,
+            "observed": recon.observed,
+            "mismatches": recon.mismatches,
+            "fail_count_delta": recon.fail_count_delta,
+        }, ts=ts)
     return recon
 
 

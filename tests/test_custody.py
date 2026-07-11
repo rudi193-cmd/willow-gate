@@ -406,14 +406,20 @@ def test_load_fails_closed_on_corrupt_line(tmp_path):
         CustodyLedger.load(str(p))
 
 
-# HARDEN-5: a session is reconciled once.
-def test_double_checkout_raises():
+# HARDEN-5 / R3-2: reconciled once — a re-check_out recomputes the truth without a
+# duplicate emit and flags already_closed; it does NOT raise (so a forged checkout
+# can't weaponize a raise into denial).
+def test_double_checkout_is_idempotent_not_raising():
     led = CustodyLedger()
     session_check_in(led, "s1", "willow", {"tools": ["read"]})
     session_record_action(led, "s1", "willow", "write")
-    session_check_out(led, "s1")
-    with pytest.raises(_ChainError):
-        session_check_out(led, "s1")
+    r1 = session_check_out(led, "s1")
+    assert r1.already_closed is False and r1.mismatches == ["write"]
+    n = len(led)
+    r2 = session_check_out(led, "s1")            # no raise
+    assert r2.already_closed is True
+    assert r2.mismatches == ["write"] and r2.reconciled is False
+    assert len(led) == n                          # no duplicate session.checkout
 
 
 # HARDEN-6: a write-first (un-provenanced) lineage does not verify.
@@ -538,21 +544,26 @@ def test_redaction_no_false_positive_on_credential_ids():
     assert led.verify().ok and len(led) == 3
 
 
-def test_redaction_new_credential_field_names():
+def test_redaction_high_signal_credential_field_names():
+    # R3-3 narrowed the set: keep the high-signal explicit names...
     led = CustodyLedger()
-    for bad in ({"bearer": "abc"}, {"cookie": "sessionid=abc"}, {"session_token": "abc"},
-                {"x_token": "abc"}, {"token": "abc"}):
+    for bad in ({"bearer": "abc"}, {"session_token": "abc"}, {"access_token": "abc"}):
         with pytest.raises(SecretRefused):
             led.append(dict(bad, kind="session.action", actor="x"))
+    # ...and DROP the ambiguous ones that false-positived (bare token/cookie, *_token suffix)
+    led.append({"kind": "session.action", "actor": "x", "token": "issue-1"})
+    led.append({"kind": "session.action", "actor": "x", "cookie": "theme=dark"})
+    led.append({"kind": "session.action", "actor": "x", "x_token": "abc"})
+    assert led.verify().ok
 
 
-# R2-4: file.checkout is folded into H5; persist stays fail-closed; edges.
+# R2-4 / R3-3: file.checkout folds into H5 as its OWN capability (not egress).
 def test_file_checkout_folds_into_h5():
     led = CustodyLedger()
     session_check_in(led, "s1", "willow", {"tools": ["read"]})
     _file_checkout(led, "f", "willow", session_id="s1")
     recon = session_check_out(led, "s1")
-    assert recon.reconciled is False and "egress" in recon.mismatches
+    assert recon.reconciled is False and "checkout" in recon.mismatches
 
 
 def test_persist_is_ascii_and_reloads(tmp_path):
@@ -577,3 +588,85 @@ def test_sig_must_be_a_string():
         led.append({"kind": "session.action", "actor": "x", "sig": 123})
     led.append({"kind": "session.action", "actor": "x", "sig": "deadbeef"})   # ok
     assert led.verify().ok
+
+
+# ============================================================================
+# Round-3 hardening — pass-3 findings
+# ============================================================================
+
+# R3-1: a second check-in inside an OPEN window cannot wipe an undeclared capability.
+def test_double_checkin_cannot_erase_evidence():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    session_record_action(led, "s1", "willow", "write")     # undeclared
+    session_check_in(led, "s1", "willow", {"tools": ["read", "write"]})  # 2nd checkin, no checkout
+    r = session_check_out(led, "s1")
+    assert r.reconciled is False and r.mismatches == ["write"]   # neither wiped nor re-broadened
+
+
+# R3-1: a reused session_id (check-in AFTER a checkout) still opens a fresh window.
+def test_reuse_after_checkout_still_opens_new_window():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    session_record_action(led, "s1", "willow", "read")
+    assert session_check_out(led, "s1").reconciled is True
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    session_record_action(led, "s1", "willow", "write")
+    r = session_check_out(led, "s1")
+    assert r.reconciled is False and r.mismatches == ["write"] and r.already_closed is False
+
+
+# R3-2: a forged session.checkout in a LOADED file can neither deny nor mask.
+def test_forged_checkout_in_loaded_file_cannot_deny_or_mask(tmp_path):
+    p = tmp_path / "c.jsonl"
+    _write_valid_chain(p, [
+        {"kind": "session.checkin", "session_id": "s1", "actor": "w", "declared": {"tools": ["read"]}},
+        {"kind": "session.checkout", "session_id": "s1", "actor": "w", "reconciled": True, "mismatches": []},
+    ])
+    led = CustodyLedger.load(str(p))                      # loads (self-consistent chain)
+    led.append({"kind": "session.action", "session_id": "s1", "actor": "w", "tool": "write"})
+    r = session_check_out(led, "s1")                      # no raise
+    assert r.reconciled is False and r.mismatches == ["write"]   # truth recomputed, not masked
+    assert r.already_closed is True
+
+
+# R3-3: benign token/cookie/*_token fields are ACCEPTED (the missing FP-acceptance tests).
+def test_redaction_no_false_positive_on_benign_token_fields():
+    led = CustodyLedger()
+    led.append({"kind": "session.action", "actor": "x", "next_token": "page2"})
+    led.append({"kind": "session.action", "actor": "x", "continuation_token": "abc"})
+    led.append({"kind": "session.action", "actor": "x", "cookie": "theme=dark"})
+    led.append({"kind": KIND_FILE_GATE_CROSS, "actor": "x", "lineage_id": "f",
+                "gate": {"name": "gh", "token": "issue-1234"}})
+    assert led.verify().ok and len(led) == 4
+    # the high-signal names still fire
+    for bad in ({"session_token": "s"}, {"access_token": "a"}, {"bearer": "b"}):
+        with pytest.raises(SecretRefused):
+            led.append(dict(bad, kind="session.action", actor="x"))
+
+
+# R3-3: declaring egress must NOT excuse a checkout (distinct capabilities).
+def test_egress_does_not_excuse_checkout():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read", "egress"]})
+    file_gate_cross(led, "f1", "willow", {"name": "jeles", "auth_ref": "c"}, session_id="s1")
+    _file_checkout(led, "f2", "willow", session_id="s1")   # a DIFFERENT file leaving custody
+    r = session_check_out(led, "s1")
+    assert r.reconciled is False and r.mismatches == ["checkout"]   # egress declared, checkout not
+
+
+# R3-3: load() raises ChainError (not raw ValueError) on an uncanonicalizable leaf,
+# and re-checks sig type.
+def test_load_raises_chainerror_on_float_and_bad_sig(tmp_path):
+    # a float leaf can't even be hashed, so write it raw; load()'s verify() must
+    # surface it as ChainError, not let the ValueError escape.
+    p = tmp_path / "c.jsonl"
+    p.write_text(json.dumps({"kind": "session.action", "actor": "x", "n": 1.5,
+                             "seq": 0, "ledger_prev_hash": GENESIS}) + "\n")
+    with pytest.raises(_ChainError):
+        CustodyLedger.load(str(p))
+    # non-string sig hashes fine (sig is excluded) but must be re-checked on load
+    p2 = tmp_path / "c2.jsonl"
+    _write_valid_chain(p2, [{"kind": "session.action", "actor": "x", "sig": 123}])
+    with pytest.raises(_ChainError):
+        CustodyLedger.load(str(p2))
