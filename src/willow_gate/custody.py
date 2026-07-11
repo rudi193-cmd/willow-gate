@@ -235,3 +235,106 @@ class CustodyLedger:
         led._path = path
         led._head = event_hash(led._events[-1]) if led._events else GENESIS
         return led
+
+
+# --- Tier 2: the session layer (H5 — check-out reconciliation) ---------------
+# check_in records the declared intent; every action is a receipt; check_out
+# folds the receipts into observed capabilities and reconciles them against what
+# was declared. Reconciliation is over OBSERVABLE CAPABILITIES, not intent: it
+# catches "declared read, did write" — never "read the wrong thing for a bad
+# reason" (that is H6, and it deliberately does not live here). The ledger stays
+# the single owner of the trust ladder's fail_count; this only computes the delta
+# the ladder should consume.
+
+
+@dataclass
+class Reconciliation:
+    session_id: str
+    reconciled: bool
+    declared: list
+    observed: list
+    mismatches: list
+    fail_count_delta: int
+
+    def __bool__(self) -> bool:
+        return self.reconciled
+
+    def exit_fail_count(self, entry_fail_count: int) -> int:
+        """The fail_count to carry into WillowGate.check_out. The ladder owns the
+        count; reconciliation only adds what the receipts prove."""
+        return int(entry_fail_count) + self.fail_count_delta
+
+
+def _declared_tools(declared: Any) -> list:
+    """Pull the declared capability list from a WillowGate-style header (or a bare
+    list / whitespace-or-comma string). Normalized to a sorted, de-duped list."""
+    if declared is None:
+        return []
+    tools = declared.get("tools", []) if isinstance(declared, dict) else declared
+    if isinstance(tools, str):
+        tools = re.split(r"[,\s]+", tools.strip())
+    return sorted({t for t in tools if t})
+
+
+def session_check_in(ledger: CustodyLedger, session_id: str, actor: str,
+                     declared: Any, *, ts: Optional[str] = None) -> dict:
+    """Record the declared intent header at the start of a session."""
+    return ledger.append({
+        "kind": KIND_SESSION_CHECKIN,
+        "session_id": session_id,
+        "actor": actor,
+        "declared": declared,
+    }, ts=ts)
+
+
+def session_record_action(ledger: CustodyLedger, session_id: str, actor: str,
+                          tool: str, *, ts: Optional[str] = None, **extra) -> dict:
+    """Record one capability actually exercised — a receipt to reconcile against."""
+    ev = {
+        "kind": KIND_SESSION_ACTION,
+        "session_id": session_id,
+        "actor": actor,
+        "tool": tool,
+    }
+    ev.update(extra)
+    return ledger.append(ev, ts=ts)
+
+
+def session_check_out(ledger: CustodyLedger, session_id: str, *,
+                      ts: Optional[str] = None) -> Reconciliation:
+    """Reconcile a session's declared intent against its observed actions, append
+    a durable session.checkout, and return the reconciliation. A capability
+    exercised but not declared is a mismatch and a fail_count increment."""
+    declared_header = None
+    observed: set = set()
+    for ev in ledger.events():
+        if ev.get("session_id") != session_id:
+            continue
+        kind = ev.get("kind")
+        if kind == KIND_SESSION_CHECKIN and declared_header is None:
+            declared_header = ev.get("declared")
+        elif kind == KIND_SESSION_ACTION and ev.get("tool"):
+            observed.add(ev["tool"])
+    if declared_header is None:
+        raise ChainError(f"no session.checkin for session {session_id!r}")
+
+    declared = _declared_tools(declared_header)
+    mismatches = sorted(observed - set(declared))
+    recon = Reconciliation(
+        session_id=session_id,
+        reconciled=not mismatches,
+        declared=declared,
+        observed=sorted(observed),
+        mismatches=mismatches,
+        fail_count_delta=len(mismatches),
+    )
+    ledger.append({
+        "kind": KIND_SESSION_CHECKOUT,
+        "session_id": session_id,
+        "reconciled": recon.reconciled,
+        "declared": recon.declared,
+        "observed": recon.observed,
+        "mismatches": recon.mismatches,
+        "fail_count_delta": recon.fail_count_delta,
+    }, ts=ts)
+    return recon

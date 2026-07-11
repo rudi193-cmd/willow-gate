@@ -115,3 +115,82 @@ def test_persist_and_reload_verifies(tmp_path):
     assert len(reloaded) == 2
     assert reloaded.verify().ok
     assert reloaded.head_hash == led.head_hash
+
+
+# ============================================================================
+# Tier 2 — the session layer (H5 check-out reconciliation)
+# ============================================================================
+from willow_gate.custody import (  # noqa: E402
+    Reconciliation, ChainError as _ChainError,
+    session_check_in, session_record_action, session_check_out,
+    KIND_SESSION_CHECKOUT,
+)
+
+
+# GATE (H5): declare tools:[read], then write — check-out must catch it.
+def test_checkout_catches_declared_read_then_wrote():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"], "trust_level": 1})
+    session_record_action(led, "s1", "willow", "read")
+    session_record_action(led, "s1", "willow", "write")   # undeclared
+    recon = session_check_out(led, "s1")
+
+    assert recon.reconciled is False
+    assert recon.mismatches == ["write"]
+    assert recon.fail_count_delta == 1
+    # the mismatch is a durable ledger entry, and the chain still verifies
+    checkout = led.events()[-1]
+    assert checkout["kind"] == KIND_SESSION_CHECKOUT
+    assert checkout["reconciled"] is False
+    assert checkout["mismatches"] == ["write"]
+    assert led.verify().ok
+
+
+def test_checkout_clean_when_within_declared():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read", "write"]})
+    session_record_action(led, "s1", "willow", "read")
+    session_record_action(led, "s1", "willow", "write")
+    recon = session_check_out(led, "s1")
+    assert recon.reconciled is True
+    assert recon.mismatches == []
+    assert recon.fail_count_delta == 0
+    assert bool(recon) is True
+
+
+# GATE: the delta feeds the trust ladder's fail_count (ladder stays the owner).
+def test_checkout_feeds_trust_ladder_fail_count():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    session_record_action(led, "s1", "willow", "write")
+    session_record_action(led, "s1", "willow", "execute")
+    recon = session_check_out(led, "s1")
+    assert recon.fail_count_delta == 2                 # write + execute undeclared
+    assert recon.exit_fail_count(3) == 5               # entry 3 -> exit 5
+
+
+def test_checkout_requires_a_checkin():
+    led = CustodyLedger()
+    session_record_action(led, "ghost", "willow", "write")
+    with pytest.raises(_ChainError):
+        session_check_out(led, "ghost")
+
+
+def test_sessions_are_reconciled_independently():
+    led = CustodyLedger()
+    session_check_in(led, "a", "willow", {"tools": ["read"]})
+    session_check_in(led, "b", "hanuman", {"tools": ["read", "write"]})
+    session_record_action(led, "a", "willow", "write")     # a: undeclared
+    session_record_action(led, "b", "hanuman", "write")    # b: declared
+    ra = session_check_out(led, "a")
+    rb = session_check_out(led, "b")
+    assert ra.reconciled is False and ra.mismatches == ["write"]
+    assert rb.reconciled is True and rb.mismatches == []
+
+
+def test_declared_accepts_header_list_or_string():
+    from willow_gate.custody import _declared_tools
+    assert _declared_tools({"tools": ["read", "write"]}) == ["read", "write"]
+    assert _declared_tools({"tools": "read, write"}) == ["read", "write"]
+    assert _declared_tools(["write", "read", "read"]) == ["read", "write"]
+    assert _declared_tools(None) == []
