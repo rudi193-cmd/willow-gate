@@ -446,6 +446,18 @@ class Reconciliation:
         return int(entry_fail_count) + self.fail_count_delta
 
 
+def _check_session_id(session_id: Any, *, allow_none: bool = False) -> None:
+    """session_id is a string by contract. Normalizing types (str(1) == str('1'))
+    merges genuinely distinct sessions, and matching by exact-but-mixed type lets
+    a mis-typed tag split a window — so we require a consistent type instead."""
+    if session_id is None:
+        if allow_none:
+            return
+        raise ValueError("session_id is required")
+    if not isinstance(session_id, str):
+        raise ValueError(f"session_id must be a string, got {type(session_id).__name__}")
+
+
 def _declared_tools(declared: Any) -> list:
     """Pull the declared capability list from a WillowGate-style header (or a bare
     list / whitespace-or-comma string). Normalized to a sorted, de-duped list."""
@@ -464,6 +476,7 @@ def _declared_tools(declared: Any) -> list:
 def session_check_in(ledger: CustodyLedger, session_id: str, actor: str,
                      declared: Any, *, ts: Optional[str] = None) -> dict:
     """Record the declared intent header at the start of a session."""
+    _check_session_id(session_id)
     return ledger.append({
         "kind": KIND_SESSION_CHECKIN,
         "session_id": session_id,
@@ -475,6 +488,7 @@ def session_check_in(ledger: CustodyLedger, session_id: str, actor: str,
 def session_record_action(ledger: CustodyLedger, session_id: str, actor: str,
                           tool: str, *, ts: Optional[str] = None, **extra) -> dict:
     """Record one capability actually exercised — a receipt to reconcile against."""
+    _check_session_id(session_id)
     ev = {
         "kind": KIND_SESSION_ACTION,
         "session_id": session_id,
@@ -494,16 +508,14 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
     # inside an OPEN window is ignored — it may not reset `observed` (else an
     # agent double-checks-in to erase an undeclared capability) nor re-broaden
     # `declared`. `closed` = the current window already has a checkout.
-    # session_id is normalized to string so a mis-typed tag (1 vs "1") can't split
-    # a window and let the mis-typed capability escape.
-    sid = str(session_id)
+    _check_session_id(session_id)
     declared_header = None
     observed: set = set()
     orphans: set = set()   # capabilities exercised in the DEAD ZONE (while closed)
     closed = False
     for ev in ledger.events():
         evsid = ev.get("session_id")
-        if evsid is None or str(evsid) != sid:
+        if evsid is None or evsid != session_id:
             continue
         kind = ev.get("kind")
         if kind == KIND_SESSION_CHECKIN:
@@ -522,7 +534,11 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
                 closed = False
             # else: re-check-in in an open window -> ignored on purpose.
         elif kind == KIND_SESSION_CHECKOUT:
+            # this checkout covered whatever came before it; `orphans` now tracks
+            # only capabilities exercised SINCE the most recent checkout, so a
+            # re-check_out with nothing new stays idempotent (no re-emit / re-feed).
             closed = True
+            orphans = set()
         elif kind == KIND_SESSION_ACTION:
             # an untyped action still counts as a capability, so it can't hide.
             cap = str(ev.get("tool") or "action").strip().lower()
@@ -532,8 +548,12 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
             (orphans if closed else observed).add(_CAPABILITY_BY_KIND[kind])
     if declared_header is None:
         raise ChainError(f"no session.checkin for session {session_id!r}")
-    # trailing dead-zone capabilities (after the last check-out, no new check-in)
-    # are covered by no declaration -> they count against the reconciliation.
+    # Trailing dead-zone capabilities (after the last check-out, no new check-in)
+    # are covered by no declaration. Because they are NEW activity since the last
+    # reconciliation, they must produce a durable record and feed the ladder — NOT
+    # be suppressed by `already_closed`. So `already_closed` is True only when the
+    # window was closed AND nothing new happened since.
+    has_new_orphans = bool(orphans)
     observed |= orphans
 
     declared = _declared_tools(declared_header)
@@ -545,7 +565,7 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
         observed=sorted(observed),
         mismatches=mismatches,
         fail_count_delta=len(mismatches),
-        already_closed=closed,
+        already_closed=(closed and not has_new_orphans),
     )
     # Recompute-don't-raise: return the TRUE reconciliation without a duplicate
     # emit. This defeats a LONE forged session.checkout in a loaded file — it can
@@ -554,7 +574,7 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
     # and a forged checkout can spoof `already_closed`. Authenticating derived
     # records against a file-writing adversary is a Tier-4 (signed-head) property,
     # not achievable here — see docs/custody-ledger-spec.md "The Tier-4 boundary".
-    if not closed:
+    if (not closed) or has_new_orphans:
         ledger._append({           # system-only kind — privileged path
             "kind": KIND_SESSION_CHECKOUT,
             "session_id": session_id,
@@ -602,11 +622,17 @@ def last_content_hash(ledger: CustodyLedger, lineage_id: str) -> Optional[str]:
     the observed hash of a recorded capture_gap (a documented break becomes the
     new baseline, so a gap is flagged once, not forever)."""
     h = None
+    seen_origin = False
     for e in _lineage_events(ledger, lineage_id):
         k = e.get("kind")
-        # Only origin/write events move the baseline. A read must NOT re-baseline,
-        # or an out-of-band edit could be laundered by recording it as a read.
-        if k in (KIND_FILE_CREATE, KIND_FILE_GATE_CROSS, KIND_FILE_WRITE) and e.get("content_hash"):
+        # Only the FIRST origin, writes, and acknowledged gaps move the baseline.
+        # A read never re-baselines, and a SECOND origin must not silently re-anchor
+        # the lineage onto attacker content.
+        if k in (KIND_FILE_CREATE, KIND_FILE_GATE_CROSS):
+            if not seen_origin and e.get("content_hash"):
+                h = e["content_hash"]
+                seen_origin = True
+        elif k == KIND_FILE_WRITE and e.get("content_hash"):
             h = e["content_hash"]
         elif k == KIND_CAPTURE_GAP and e.get("observed_content_hash"):
             h = e["observed_content_hash"]
@@ -616,6 +642,7 @@ def last_content_hash(ledger: CustodyLedger, lineage_id: str) -> Optional[str]:
 def file_create(ledger: CustodyLedger, lineage_id: str, actor: str,
                 content_hash: str, *, path: Optional[str] = None,
                 session_id: Optional[str] = None, ts: Optional[str] = None) -> dict:
+    _check_session_id(session_id, allow_none=True)
     return ledger.append({
         "kind": KIND_FILE_CREATE, "lineage_id": lineage_id, "actor": actor,
         "content_hash": content_hash, "path": path, "session_id": session_id,
@@ -625,6 +652,7 @@ def file_create(ledger: CustodyLedger, lineage_id: str, actor: str,
 def file_read(ledger: CustodyLedger, lineage_id: str, actor: str,
               content_hash: str, *, session_id: Optional[str] = None,
               ts: Optional[str] = None) -> dict:
+    _check_session_id(session_id, allow_none=True)
     return ledger.append({
         "kind": KIND_FILE_READ, "lineage_id": lineage_id, "actor": actor,
         "content_hash": content_hash, "session_id": session_id,
@@ -638,6 +666,7 @@ def file_write(ledger: CustodyLedger, lineage_id: str, actor: str,
     """Record a new version. If parent is not given it auto-chains to the last
     recorded content hash for the lineage. Pass session_id to tie the write to a
     session so H5 check-out reconciles it."""
+    _check_session_id(session_id, allow_none=True)
     if parent_content_hash is None:
         parent_content_hash = last_content_hash(ledger, lineage_id)
     return ledger.append({
@@ -655,6 +684,7 @@ def file_gate_cross(ledger: CustodyLedger, lineage_id: str, actor: str,
     """Record a file crossing an external gate (the received-file crossing). The
     ledger's fail-closed redaction refuses a live secret carried in `gate`. Pass
     session_id so H5 reconciles the egress."""
+    _check_session_id(session_id, allow_none=True)
     return ledger.append({
         "kind": KIND_FILE_GATE_CROSS, "lineage_id": lineage_id, "actor": actor,
         "gate": gate, "content_hash": content_hash, "session_id": session_id,
@@ -664,6 +694,7 @@ def file_gate_cross(ledger: CustodyLedger, lineage_id: str, actor: str,
 def file_checkout(ledger: CustodyLedger, lineage_id: str, actor: str,
                   *, session_id: Optional[str] = None,
                   ts: Optional[str] = None) -> dict:
+    _check_session_id(session_id, allow_none=True)
     return ledger.append({
         "kind": KIND_FILE_CHECKOUT, "lineage_id": lineage_id, "actor": actor,
         "session_id": session_id,
@@ -688,23 +719,35 @@ def verify_lineage(ledger: CustodyLedger, lineage_id: str) -> VerifyResult:
     if evs[0].get("kind") not in (KIND_FILE_CREATE, KIND_FILE_GATE_CROSS):
         return VerifyResult(False, "lineage has no origin", evs[0].get("seq"))
     effective: Optional[str] = None
-    for e in evs:
+    known: set = set()   # every content hash this lineage has legitimately held
+    for i, e in enumerate(evs):
         k = e.get("kind")
-        if k == KIND_FILE_WRITE:
+        if k in (KIND_FILE_CREATE, KIND_FILE_GATE_CROSS):
+            ch = e.get("content_hash")
+            if i == 0:
+                if ch:
+                    effective = ch
+                    known.add(ch)
+            elif ch and ch != effective:
+                # a second origin may not re-anchor the lineage onto a new hash.
+                return VerifyResult(False, "lineage has a conflicting second origin", e.get("seq"))
+        elif k == KIND_FILE_WRITE:
+            if not e.get("content_hash"):
+                return VerifyResult(False, "write missing content_hash", e.get("seq"))
             if e.get("parent_content_hash") != effective:
                 return VerifyResult(False, "broken lineage chain", e.get("seq"))
-            if e.get("content_hash"):
-                effective = e["content_hash"]
-        elif k in (KIND_FILE_CREATE, KIND_FILE_GATE_CROSS):
-            if e.get("content_hash"):
-                effective = e["content_hash"]
+            effective = e["content_hash"]
+            known.add(effective)
         elif k == KIND_CAPTURE_GAP:
             if e.get("observed_content_hash"):
                 effective = e["observed_content_hash"]
+                known.add(effective)
         elif k == KIND_FILE_READ:
-            # a read must not re-baseline; a read of a hash inconsistent with the
-            # baseline is an unexplained change that must surface, not be adopted.
-            if e.get("content_hash") and effective is not None and e["content_hash"] != effective:
+            # A read never re-baselines. A read of a hash the lineage has NEVER
+            # held is an unexplained change and must surface; a read of any
+            # previously-held version (a cached/older copy) is fine.
+            ch = e.get("content_hash")
+            if ch and ch not in known:
                 return VerifyResult(False, "read observed unexplained content hash", e.get("seq"))
         # file.checkout: ignored (moves nothing)
     return VerifyResult(True, "ok")

@@ -131,8 +131,11 @@ neither reset `observed` nor re-broaden `declared`. Capabilities exercised in th
 after a check-out, before the next check-in — are not discarded either: they carry into the next
 window's `observed`, so a capability slipped in between windows and then narrowly re-declared is
 still caught (the symmetric twin of the pre-first-check-in fold). `check_out` **never raises** on an
-already-closed window: it recomputes the true reconciliation from the window's actions and returns it
-(flagging `already_closed`, skipping a duplicate emit).
+already-closed window: it recomputes the true reconciliation from the window's actions and returns it.
+`already_closed` is True (and the emit is skipped) **only** when the window was closed *and* nothing
+new happened since the last check-out. Capabilities exercised in the trailing dead zone (after a
+check-out, no new check-in) are **new activity**: they emit a durable check-out and feed the ladder,
+and only a re-check_out with genuinely nothing new is idempotent.
 
 **The Tier-4 boundary (stated honestly — the docs must not lie).** `check_out`'s recompute-don't-raise
 defeats a *lone* forged `session.checkout`: it can neither deny nor mask. It does **not** fully close
@@ -190,15 +193,18 @@ forgery or a tail-truncation is caught *only* by the checkpoint signature (see t
   path can launder an out-of-band edit as a normal `file_write` and no gap is raised — that case is
   caught (if at all) by routing the write through the gate (Tier 3b) and by H5 reconciliation, not
   by the detector. A lineage with no origin (`file.create`/`file.gate_cross` first) does not verify.
-- **Only origin/write/gap events move the lineage baseline — a `read` never re-baselines.** A
-  `file.read` reporting a `content_hash` that disagrees with the effective baseline **fails**
-  `verify_lineage` (an out-of-band change cannot be laundered by recording it as a read, then chaining
-  a later write onto the read's hash). `last_content_hash` advances only on `file.create`/
-  `file.gate_cross`/`file.write` and an acknowledged `capture_gap`.
+- **Only the first origin, writes, and acknowledged gaps move the lineage baseline.** A `file.read`
+  never re-baselines; a read of a hash the lineage has **never held** fails `verify_lineage` (an
+  out-of-band change can't be laundered as a read), while a read of any *previously-held* version (a
+  cached/older copy) is fine. A **second** `file.create`/`file.gate_cross` may not re-anchor the
+  lineage onto a new hash (fails as a conflicting second origin — the cheap Tier-2 guard against the
+  second-origin variant of the recorder-controlled launder). A `file.write` with no `content_hash`
+  fails. `last_content_hash` advances only on the *first* origin, writes, and an acknowledged gap.
 - **A capability event with no (or a mis-typed) `session_id` is not reconciled.** H5 can only fold
   events tagged with the session; an untagged `file.checkout`/`file.write`/etc. is unattributable and
-  escapes the check. The reconciler normalizes ids to strings (so `1` and `"1"` match), but a `None`
-  or otherwise absent tag is still unattributable. This is the **Tier-3b hook's duty**: it must inject
+  escapes the check. `session_id` is a **string by contract** — a non-string is refused, so distinct
+  sessions can't merge (no `1`/`"1"` coalescing) and a mis-typed tag can't split a window; but a
+  `None` or otherwise absent tag is still unattributable. This is the **Tier-3b hook's duty**: it must inject
   the *active* `session_id` on every capability event, so a raw untagged call is outside
   reconciliation by construction, not a gap the core can close alone.
 - **Completeness = capture points.** The ledger is only as complete as the hooks that feed it.

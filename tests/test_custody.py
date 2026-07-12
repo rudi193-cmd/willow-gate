@@ -627,7 +627,9 @@ def test_forged_checkout_in_loaded_file_cannot_deny_or_mask(tmp_path):
     led.append({"kind": "session.action", "session_id": "s1", "actor": "w", "tool": "write"})
     r = session_check_out(led, "s1")                      # no raise
     assert r.reconciled is False and r.mismatches == ["write"]   # truth recomputed, not masked
-    assert r.already_closed is True
+    # the real write is new activity AFTER the forged checkout -> it is fed, not
+    # suppressed (R6 F2): already_closed is False here.
+    assert r.already_closed is False
 
 
 # R3-3: benign token/cookie/*_token fields are ACCEPTED (the missing FP-acceptance tests).
@@ -808,16 +810,88 @@ def test_read_does_not_relaunder_lineage():
     assert verify_lineage(led2, "g").ok
 
 
-# R5-3 (Finding 3): mis-typed session_id can't split a window.
-def test_session_id_type_confusion_is_normalized():
+# R6-1 (F1): session_id is a string by contract — a non-str is refused, and two
+# genuinely distinct sessions cannot collide under normalization.
+def test_session_id_string_contract():
     led = CustodyLedger()
-    session_check_in(led, 1, "willow", {"tools": ["read"]})     # int id
-    led.append({"kind": KIND_SESSION_ACTION, "session_id": "1", "actor": "willow", "tool": "write"})  # str id
-    r = session_check_out(led, 1)
-    assert r.reconciled is False and r.mismatches == ["write"]
+    for bad in (1, 1.0, ("s",), None):
+        with pytest.raises(ValueError):
+            session_check_in(led, bad, "willow", {"tools": ["read"]})
+    with pytest.raises(ValueError):
+        session_record_action(led, 7, "willow", "read")
+    # distinct string ids stay distinct (no int/str merge)
+    session_check_in(led, "1", "alice", {"tools": ["read"]})
+    session_record_action(led, "1", "alice", "read")
+    assert session_check_out(led, "1").reconciled is True
 
 
 def test_secret_field_trailing_space_key_still_caught():
     led = CustodyLedger()
     with pytest.raises(SecretRefused):
         led.append({"kind": "session.action", "actor": "x", "access_token ": "opaque"})
+
+
+# ============================================================================
+# Round-6 — pass-6 findings (F1 session merge, F2 trailing feed, F3/F4/F5 lineage)
+# ============================================================================
+from willow_gate.custody import KIND_FILE_WRITE as _FW, KIND_FILE_CREATE as _FC2  # noqa: E402
+
+
+# R6-1 (F1): two DISTINCT sessions can no longer merge (the round-5 regression).
+def test_distinct_sessions_do_not_merge():
+    led = CustodyLedger()
+    session_check_in(led, "alice", "alice", {"tools": ["read"]})
+    session_record_action(led, "alice", "alice", "read")
+    session_check_in(led, "mallory", "mallory", {"tools": ["write"]})
+    session_record_action(led, "mallory", "mallory", "write")
+    assert session_check_out(led, "alice").reconciled is True     # not broken by mallory
+    assert session_check_out(led, "mallory").mismatches == []     # declared its own write
+
+
+# R6-2 (F2): trailing dead-zone caps emit a durable checkout AND aren't suppressed.
+def test_trailing_orphans_emit_and_feed():
+    led = CustodyLedger()
+    session_check_in(led, "s", "willow", {"tools": ["read"]})
+    session_record_action(led, "s", "willow", "read")
+    session_check_out(led, "s")                                   # clean close (#1)
+    n1 = sum(1 for e in led.events() if e["kind"] == KIND_SESSION_CHECKOUT)
+    session_record_action(led, "s", "willow", "write")            # trailing undeclared
+    r = session_check_out(led, "s")
+    n2 = sum(1 for e in led.events() if e["kind"] == KIND_SESSION_CHECKOUT)
+    assert r.mismatches == ["write"]
+    assert r.already_closed is False        # NEW activity -> ladder must be fed
+    assert n2 == n1 + 1                      # a durable record was emitted
+    # a further re-check_out with nothing new is idempotent again
+    r2 = session_check_out(led, "s")
+    n3 = sum(1 for e in led.events() if e["kind"] == KIND_SESSION_CHECKOUT)
+    assert r2.already_closed is True and n3 == n2
+
+
+# R6-3 (F3): a second origin cannot re-anchor the lineage.
+def test_second_origin_launder_caught():
+    led = CustodyLedger()
+    file_create(led, "f", "willow", _ch("v1"))
+    _file_read(led, "f", "willow", _ch("v1"))
+    led.append({"kind": _FC2, "lineage_id": "f", "actor": "mallory", "content_hash": _ch("evil")})
+    res = verify_lineage(led, "f")
+    assert not res.ok and "second origin" in res.reason
+
+
+# R6-3 (F4): a write with no content_hash fails verify_lineage.
+def test_hashless_write_fails_verify_lineage():
+    led = CustodyLedger()
+    file_create(led, "f", "willow", _ch("v1"))
+    led.append({"kind": _FW, "lineage_id": "f", "actor": "willow", "parent_content_hash": _ch("v1")})
+    res = verify_lineage(led, "f")
+    assert not res.ok and "content_hash" in res.reason
+
+
+# R6-3 (F5): a read of a previously-held (older) version is fine; a novel one fails.
+def test_read_of_historical_version_ok():
+    led = CustodyLedger()
+    file_create(led, "f", "willow", _ch("v1"))
+    file_write(led, "f", "willow", _ch("v2"))
+    _file_read(led, "f", "willow", _ch("v1"))        # cached/older copy — legitimate
+    assert verify_lineage(led, "f").ok
+    _file_read(led, "f", "willow", _ch("v_never"))   # never-held — unexplained
+    assert not verify_lineage(led, "f").ok
