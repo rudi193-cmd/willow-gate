@@ -153,7 +153,7 @@ _BENIGN_TOKEN_FIELDS = frozenset({
 
 
 def _is_secret_field(key: str) -> bool:
-    k = key.lower()
+    k = key.strip().lower()   # strip so "access_token " (trailing space) can't dodge
     if k.endswith(_ID_SUFFIXES):
         return False
     if k in _SECRET_FIELD_NAMES:
@@ -494,11 +494,16 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
     # inside an OPEN window is ignored — it may not reset `observed` (else an
     # agent double-checks-in to erase an undeclared capability) nor re-broaden
     # `declared`. `closed` = the current window already has a checkout.
+    # session_id is normalized to string so a mis-typed tag (1 vs "1") can't split
+    # a window and let the mis-typed capability escape.
+    sid = str(session_id)
     declared_header = None
     observed: set = set()
+    orphans: set = set()   # capabilities exercised in the DEAD ZONE (while closed)
     closed = False
     for ev in ledger.events():
-        if ev.get("session_id") != session_id:
+        evsid = ev.get("session_id")
+        if evsid is None or str(evsid) != sid:
             continue
         kind = ev.get("kind")
         if kind == KIND_SESSION_CHECKIN:
@@ -508,21 +513,28 @@ def session_check_out(ledger: CustodyLedger, session_id: str, *,
                 # declared must still be caught (F3).
                 declared_header = ev.get("declared")
             elif closed:
-                # a genuinely fresh window after a check-out: reset.
+                # a fresh window after a check-out: seed it with the dead-zone
+                # orphans (they must not vanish), not an empty set — the symmetric
+                # twin of the pre-first-check-in fold.
                 declared_header = ev.get("declared")
-                observed = set()
+                observed = set(orphans)
+                orphans = set()
                 closed = False
             # else: re-check-in in an open window -> ignored on purpose.
         elif kind == KIND_SESSION_CHECKOUT:
             closed = True
         elif kind == KIND_SESSION_ACTION:
             # an untyped action still counts as a capability, so it can't hide.
-            observed.add(str(ev.get("tool") or "action").strip().lower())
+            cap = str(ev.get("tool") or "action").strip().lower()
+            (orphans if closed else observed).add(cap)
         elif kind in _CAPABILITY_BY_KIND:
             # a write/egress/checkout routed through the file path is folded too.
-            observed.add(_CAPABILITY_BY_KIND[kind])
+            (orphans if closed else observed).add(_CAPABILITY_BY_KIND[kind])
     if declared_header is None:
         raise ChainError(f"no session.checkin for session {session_id!r}")
+    # trailing dead-zone capabilities (after the last check-out, no new check-in)
+    # are covered by no declaration -> they count against the reconciliation.
+    observed |= orphans
 
     declared = _declared_tools(declared_header)
     mismatches = sorted(observed - set(declared))
@@ -591,9 +603,12 @@ def last_content_hash(ledger: CustodyLedger, lineage_id: str) -> Optional[str]:
     new baseline, so a gap is flagged once, not forever)."""
     h = None
     for e in _lineage_events(ledger, lineage_id):
-        if e.get("content_hash"):
+        k = e.get("kind")
+        # Only origin/write events move the baseline. A read must NOT re-baseline,
+        # or an out-of-band edit could be laundered by recording it as a read.
+        if k in (KIND_FILE_CREATE, KIND_FILE_GATE_CROSS, KIND_FILE_WRITE) and e.get("content_hash"):
             h = e["content_hash"]
-        elif e.get("kind") == KIND_CAPTURE_GAP and e.get("observed_content_hash"):
+        elif k == KIND_CAPTURE_GAP and e.get("observed_content_hash"):
             h = e["observed_content_hash"]
     return h
 
@@ -674,13 +689,24 @@ def verify_lineage(ledger: CustodyLedger, lineage_id: str) -> VerifyResult:
         return VerifyResult(False, "lineage has no origin", evs[0].get("seq"))
     effective: Optional[str] = None
     for e in evs:
-        if e.get("kind") == KIND_FILE_WRITE:
+        k = e.get("kind")
+        if k == KIND_FILE_WRITE:
             if e.get("parent_content_hash") != effective:
                 return VerifyResult(False, "broken lineage chain", e.get("seq"))
-        if e.get("content_hash"):
-            effective = e["content_hash"]
-        elif e.get("kind") == KIND_CAPTURE_GAP and e.get("observed_content_hash"):
-            effective = e["observed_content_hash"]
+            if e.get("content_hash"):
+                effective = e["content_hash"]
+        elif k in (KIND_FILE_CREATE, KIND_FILE_GATE_CROSS):
+            if e.get("content_hash"):
+                effective = e["content_hash"]
+        elif k == KIND_CAPTURE_GAP:
+            if e.get("observed_content_hash"):
+                effective = e["observed_content_hash"]
+        elif k == KIND_FILE_READ:
+            # a read must not re-baseline; a read of a hash inconsistent with the
+            # baseline is an unexplained change that must surface, not be adopted.
+            if e.get("content_hash") and effective is not None and e["content_hash"] != effective:
+                return VerifyResult(False, "read observed unexplained content hash", e.get("seq"))
+        # file.checkout: ignored (moves nothing)
     return VerifyResult(True, "ok")
 
 

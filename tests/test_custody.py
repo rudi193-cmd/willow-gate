@@ -760,3 +760,64 @@ def test_forged_capture_gap_launders_lineage_documented_limit(tmp_path):
     # KNOWN LIMIT (Tier-4): a write parented on attacker content Z chains cleanly
     # because the forged capture_gap made Z the baseline.
     assert _verify_lineage(led, "f").ok is True
+
+
+# ============================================================================
+# Round-5 — pass-5 findings (dead zone, read-launder, session_id type)
+# ============================================================================
+from willow_gate.custody import (  # noqa: E402
+    file_read as _file_read, last_content_hash as _last_ch,
+    KIND_FILE_READ as _FR,
+)
+
+
+# R5-1 (Finding 1): a capability in the DEAD ZONE (after checkout, before next
+# check-in) is not wiped by the reset — it folds into the next window.
+def test_dead_zone_capability_is_not_wiped():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    session_record_action(led, "s1", "willow", "read")
+    session_check_out(led, "s1")                        # window 1 closes clean
+    session_record_action(led, "s1", "willow", "write") # dead-zone undeclared write
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})   # re-check-in
+    r = session_check_out(led, "s1")
+    assert r.reconciled is False and r.mismatches == ["write"]
+
+
+def test_trailing_dead_zone_capability_is_caught():
+    led = CustodyLedger()
+    session_check_in(led, "s1", "willow", {"tools": ["read"]})
+    session_check_out(led, "s1")                        # closes
+    session_record_action(led, "s1", "willow", "write") # trailing, no new check-in
+    r = session_check_out(led, "s1")                    # re-check_out surfaces it
+    assert r.reconciled is False and "write" in r.mismatches
+
+
+# R5-2 (Finding 2): a read must not re-baseline; an inconsistent read fails verify.
+def test_read_does_not_relaunder_lineage():
+    led = CustodyLedger()
+    file_create(led, "f", "willow", _ch("v1"))
+    _file_read(led, "f", "willow", _ch("v_evil"))       # out-of-band change seen as a read
+    assert _last_ch(led, "f") == _ch("v1")              # baseline NOT advanced
+    res = verify_lineage(led, "f")
+    assert not res.ok and "unexplained" in res.reason
+    # a consistent read is fine
+    led2 = CustodyLedger()
+    file_create(led2, "g", "willow", _ch("v1"))
+    _file_read(led2, "g", "willow", _ch("v1"))
+    assert verify_lineage(led2, "g").ok
+
+
+# R5-3 (Finding 3): mis-typed session_id can't split a window.
+def test_session_id_type_confusion_is_normalized():
+    led = CustodyLedger()
+    session_check_in(led, 1, "willow", {"tools": ["read"]})     # int id
+    led.append({"kind": KIND_SESSION_ACTION, "session_id": "1", "actor": "willow", "tool": "write"})  # str id
+    r = session_check_out(led, 1)
+    assert r.reconciled is False and r.mismatches == ["write"]
+
+
+def test_secret_field_trailing_space_key_still_caught():
+    led = CustodyLedger()
+    with pytest.raises(SecretRefused):
+        led.append({"kind": "session.action", "actor": "x", "access_token ": "opaque"})
