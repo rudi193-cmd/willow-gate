@@ -169,6 +169,30 @@ events. That makes the whole chain tamper-*evident* under the operator's key at 
 **Gate:** an *in-place* alteration of any past event breaks chain verification; a re-derived-chain
 forgery or a tail-truncation is caught *only* by the checkpoint signature (see the boundary below).
 
+**As built.** The signer is deliberately signer-agnostic: the core wants only `sign(data:
+bytes) -> str` and `verify(data: bytes, sig: str) -> bool`, so tests can drive it with a
+deterministic HMAC signer and production uses `GpgSigner` (python-gnupg, detached ASCII
+signatures, imported lazily so the module stays stdlib-only otherwise).
+
+- `checkpoint(ledger, signer)` reads the current chain head, signs *the head hash itself* (not
+  every event — the head already commits to the whole prefix through the chain), and appends a
+  `checkpoint` event carrying `covers_to_seq`, `head_hash`, and the detached `sig`. `checkpoint`
+  is a **system-only kind**: public `append()` refuses it; only the privileged `_append()` emits
+  it. The checkpoint seals the prefix *before* itself — it is not in its own coverage.
+- `verify_checkpoint(ledger, ev, signer)` **recomputes** the head over `events[0..covers_to_seq]`
+  and fails if the chain is broken there, if the recomputed head ≠ the claimed `head_hash`, or if
+  the signature over the claimed head does not verify. This is what closes the Tier-1 boundary: a
+  re-derived-chain forgery changes the recomputed head, so it fails here even though bare Tier-1
+  `verify()` accepts it; and if the attacker also rewrites the stored head to match their forgery,
+  the signature over it no longer verifies (they lack the key). Both truncation and re-derivation
+  within a checkpoint's coverage are caught.
+- `export_sidecar` / `verify_sidecar` sign a portable slice (one lineage or one session) so it can
+  be checked **offline, with no ledger present**. The signed payload is `{subject, anchor_head,
+  events}` canonicalized; the returned dict carries `authenticity_only: True` and `verify_sidecar`
+  returns a reason that says so out loud — it proves the shown events are authentic, **not** that
+  none were omitted. It is authenticity, not completeness, and the code refuses to let a caller
+  forget that (see the boundary note below).
+
 ---
 
 ## What it does NOT do (do not overclaim)
@@ -238,8 +262,11 @@ This is assembly, not invention.
 3. **Tier 3 — file custody.** `file.*` events wired into the pre-tool hook and the integrations
    egress lane; lineage chain; diff capture; `capture_gap` on unexplained jumps. *Gate:* a file's
    full lineage is queryable start to finish; an out-of-band edit shows as a `capture_gap`.
-4. **Tier 4 — sealing.** PGP checkpoint signing + the portable signed sidecar. *Gate:* a tampered
-   event fails signature verification; a sidecar verifies offline and is labeled weaker-than-ledger.
+4. **Tier 4 — sealing.** PGP checkpoint signing (sign the chain head) + the portable signed
+   sidecar. *Gate:* within a checkpoint's coverage a re-derived-chain forgery **and** a
+   tail-truncation both fail `verify_checkpoint` (which bare Tier-1 `verify()` cannot catch); a
+   rewritten head fails the signature; the `checkpoint` kind is refused by public `append()`; a
+   sidecar verifies offline and is labeled `authenticity_only` (weaker than the ledger).
 
 ## Open questions (decide / test before building past Tier 2)
 

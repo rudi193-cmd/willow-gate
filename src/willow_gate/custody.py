@@ -68,18 +68,20 @@ KIND_SESSION_CHECKIN = "session.checkin"
 KIND_SESSION_ACTION = "session.action"
 KIND_SESSION_CHECKOUT = "session.checkout"
 KIND_CAPTURE_GAP = "capture_gap"
+KIND_CHECKPOINT = "checkpoint"   # Tier 4: a signed head hash
 
 # The closed set of legal kinds. append() refuses anything else.
 _KINDS = frozenset({
     KIND_FILE_CREATE, KIND_FILE_READ, KIND_FILE_WRITE, KIND_FILE_GATE_CROSS,
     KIND_FILE_CHECKOUT, KIND_SESSION_CHECKIN, KIND_SESSION_ACTION,
-    KIND_SESSION_CHECKOUT, KIND_CAPTURE_GAP,
+    KIND_SESSION_CHECKOUT, KIND_CAPTURE_GAP, KIND_CHECKPOINT,
 })
 
 # Derived records the ledger concludes for itself — NOT receipts a caller may
 # supply. The public append() refuses them; only check_out()/detect_capture_gap()
-# emit them, so the party being judged cannot forge or pre-empt the judgement.
-_SYSTEM_KINDS = frozenset({KIND_SESSION_CHECKOUT, KIND_CAPTURE_GAP})
+# /checkpoint() emit them, so the party being judged cannot forge or pre-empt the
+# judgement.
+_SYSTEM_KINDS = frozenset({KIND_SESSION_CHECKOUT, KIND_CAPTURE_GAP, KIND_CHECKPOINT})
 
 # Which capability a session-tagged event exercises, for H5 reconciliation. A
 # capability recorded through ANY of these paths — not just session.action —
@@ -775,3 +777,139 @@ def detect_capture_gap(ledger: CustodyLedger, lineage_id: str,
         "observed_content_hash": observed_content_hash,
         "note": "observed content hash has no explaining write event",
     }, ts=ts)
+
+
+# --- Tier 4: sealing (signed checkpoints + portable sidecar) ------------------
+# Hash-chaining gives tamper-DETECTION for in-place edits (Tier 1). Signing the
+# chain head gives tamper-EVIDENCE for the whole prefix under the operator's key —
+# and it is what authenticates that a derived record (session.checkout, capture_gap)
+# is the ledger's OWN, closing the forged-derived-record class that Tiers 1-3 can
+# only document. A "signer" is any object exposing:
+#     sign(data: bytes) -> str            # a detached signature
+#     verify(data: bytes, sig: str) -> bool
+# The core below is signer-agnostic (so gate tests run deterministically); GpgSigner
+# is the production one.
+
+
+def _recompute_head(events: list, upto_seq: int) -> Optional[str]:
+    """The chain head over events[0..upto_seq], or None if the chain is broken."""
+    prev = GENESIS
+    for e in events:
+        if e.get("seq", -1) > upto_seq:
+            break
+        if e.get("ledger_prev_hash") != prev:
+            return None
+        prev = event_hash(e)
+    return prev
+
+
+def checkpoint(ledger: CustodyLedger, signer: Any, *, ts: Optional[str] = None) -> dict:
+    """Seal the current chain head with a signature and append a checkpoint record.
+    The head commits (via the chain) to every event before it, so one signature
+    makes the whole prefix tamper-evident at bounded cost. System-only kind."""
+    covers = len(ledger) - 1
+    head = ledger.head_hash
+    sig = signer.sign(head.encode("utf-8"))
+    if isinstance(sig, (bytes, bytearray)):
+        sig = sig.decode("utf-8")
+    return ledger._append({
+        "kind": KIND_CHECKPOINT,
+        "covers_to_seq": covers,
+        "head_hash": head,
+        "sig": str(sig),
+    }, ts=ts)
+
+
+def verify_checkpoint(ledger: CustodyLedger, checkpoint_event: dict, signer: Any) -> VerifyResult:
+    """Recompute the sealed head and verify the signature. Any tamper to a covered
+    event changes the recomputed head (or breaks the chain), so it fails here even
+    though Tier 1's verify() alone can be fooled by a fully re-derived forgery. If an
+    attacker also rewrites the stored head to match their forgery, the signature over
+    it no longer verifies (they lack the key)."""
+    covers = checkpoint_event.get("covers_to_seq")
+    claimed = checkpoint_event.get("head_hash")
+    sig = checkpoint_event.get("sig")
+    if not isinstance(covers, int) or not isinstance(claimed, str) or not isinstance(sig, str):
+        return VerifyResult(False, "malformed checkpoint")
+    computed = _recompute_head(ledger.events(), covers)
+    if computed is None:
+        return VerifyResult(False, "chain broken within checkpoint coverage", covers)
+    if computed != claimed:
+        return VerifyResult(False, "sealed head does not match recomputed head", covers)
+    try:
+        ok = bool(signer.verify(claimed.encode("utf-8"), sig))
+    except Exception:
+        ok = False
+    if not ok:
+        return VerifyResult(False, "checkpoint signature invalid", covers)
+    return VerifyResult(True, "ok", covers)
+
+
+def export_sidecar(ledger: CustodyLedger, signer: Any, *,
+                   lineage_id: Optional[str] = None,
+                   session_id: Optional[str] = None) -> dict:
+    """A portable, signed slice for offline use. It proves the shown events are
+    AUTHENTIC (signed) — NOT that none were omitted. Explicitly weaker than the
+    ledger; the returned dict carries `authenticity_only: True` to say so."""
+    if (lineage_id is None) == (session_id is None):
+        raise ValueError("export_sidecar needs exactly one of lineage_id / session_id")
+    if lineage_id is not None:
+        events = _lineage_events(ledger, lineage_id)
+        subject = {"lineage_id": lineage_id}
+    else:
+        events = [e for e in ledger.events() if e.get("session_id") == session_id]
+        subject = {"session_id": session_id}
+    payload = {"subject": subject, "anchor_head": ledger.head_hash, "events": events}
+    sig = signer.sign(canonicalize(payload))
+    if isinstance(sig, (bytes, bytearray)):
+        sig = sig.decode("utf-8")
+    return {**payload, "sig": str(sig), "authenticity_only": True}
+
+
+def verify_sidecar(sidecar: dict, signer: Any) -> VerifyResult:
+    """Verify a sidecar's signature OFFLINE (no ledger). Returns ok with an explicit
+    weaker-than-ledger note: authenticity of the shown events only, not completeness."""
+    sig = sidecar.get("sig")
+    if not isinstance(sig, str):
+        return VerifyResult(False, "malformed sidecar")
+    payload = {k: v for k, v in sidecar.items() if k not in ("sig", "authenticity_only")}
+    try:
+        ok = bool(signer.verify(canonicalize(payload), sig))
+    except Exception:
+        ok = False
+    if not ok:
+        return VerifyResult(False, "sidecar signature invalid")
+    return VerifyResult(True, "authentic (shown events only, NOT completeness)")
+
+
+class GpgSigner:
+    """Production signer over python-gnupg detached signatures. Imports gnupg lazily
+    so the rest of the module stays stdlib-only."""
+
+    def __init__(self, fingerprint: str, *, gnupghome: Optional[str] = None,
+                 passphrase: Optional[str] = None) -> None:
+        import gnupg  # optional dependency, required only for this signer
+        self._g = gnupg.GPG(gnupghome=gnupghome) if gnupghome else gnupg.GPG()
+        self._fpr = fingerprint
+        self._pass = passphrase
+
+    def sign(self, data: bytes) -> str:
+        s = self._g.sign(data, keyid=self._fpr, detach=True, passphrase=self._pass)
+        if not s or not str(s).strip():
+            raise RuntimeError("gpg detached-sign failed")
+        return str(s)
+
+    def verify(self, data: bytes, sig: str) -> bool:
+        import os
+        import tempfile
+        fd, p = tempfile.mkstemp(suffix=".asc")
+        try:
+            os.write(fd, sig.encode("utf-8") if isinstance(sig, str) else sig)
+            os.close(fd)
+            v = self._g.verify_data(p, data)
+            return bool(getattr(v, "valid", False))
+        finally:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass

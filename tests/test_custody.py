@@ -895,3 +895,105 @@ def test_read_of_historical_version_ok():
     assert verify_lineage(led, "f").ok
     _file_read(led, "f", "willow", _ch("v_never"))   # never-held — unexplained
     assert not verify_lineage(led, "f").ok
+
+
+# ============================================================================
+# Tier 4 — sealing (signed checkpoints + portable sidecar)
+# ============================================================================
+import hmac as _hmac  # noqa: E402
+from willow_gate.custody import (  # noqa: E402
+    checkpoint, verify_checkpoint, export_sidecar, verify_sidecar, GpgSigner,
+    KIND_CHECKPOINT,
+)
+
+
+class _HmacSigner:
+    """A deterministic, dependency-free signer so the Tier-4 gates run everywhere."""
+    def __init__(self, key=b"operator-key"):
+        self.key = key
+
+    def sign(self, data):
+        return _hmac.new(self.key, data, hashlib.sha256).hexdigest()
+
+    def verify(self, data, sig):
+        try:
+            return _hmac.compare_digest(sig, self.sign(data))
+        except Exception:
+            return False
+
+
+def test_checkpoint_seals_and_verifies():
+    led = CustodyLedger()
+    for t in ("read", "write", "grep"):
+        session_record_action(led, "s", "willow", t)
+    s = _HmacSigner()
+    cp = checkpoint(led, s)
+    assert cp["kind"] == KIND_CHECKPOINT and cp["covers_to_seq"] == 2
+    assert verify_checkpoint(led, cp, s).ok
+
+
+# GATE (Tier 4 payoff): the re-derivation forgery Tier 1 CANNOT catch is caught.
+def test_checkpoint_catches_rederivation_forgery():
+    led = CustodyLedger()
+    for t in ("read", "write", "grep"):
+        session_record_action(led, "s", "willow", t)
+    s = _HmacSigner()
+    cp = checkpoint(led, s)
+    assert verify_checkpoint(led, cp, s).ok
+    # tamper a covered event AND re-derive every subsequent prev_hash
+    led._events[1]["tool"] = "exfiltrate"
+    for i in range(2, len(led._events)):
+        led._events[i]["ledger_prev_hash"] = event_hash(led._events[i - 1])
+    assert led.verify().ok                          # Tier 1 IS fooled (documented limit)
+    assert not verify_checkpoint(led, cp, s).ok     # Tier 4 is NOT fooled
+
+
+def test_checkpoint_wrong_key_fails():
+    led = CustodyLedger()
+    session_record_action(led, "s", "willow", "read")
+    cp = checkpoint(led, _HmacSigner(b"real"))
+    assert not verify_checkpoint(led, cp, _HmacSigner(b"attacker")).ok
+
+
+# GATE: checkpoints are system-only — a caller cannot forge one.
+def test_checkpoint_is_system_only():
+    led = CustodyLedger()
+    with pytest.raises(ValueError):
+        led.append({"kind": KIND_CHECKPOINT, "covers_to_seq": 0,
+                    "head_hash": "0" * 64, "sig": "x"})
+
+
+# GATE: a sidecar verifies OFFLINE and is labeled weaker-than-ledger.
+def test_sidecar_verifies_offline_and_is_weaker():
+    led = CustodyLedger()
+    file_create(led, "f", "willow", _ch("v1"))
+    file_write(led, "f", "willow", _ch("v2"))
+    s = _HmacSigner()
+    sc = export_sidecar(led, s, lineage_id="f")
+    assert sc["authenticity_only"] is True
+    res = verify_sidecar(sc, s)                     # no ledger passed — offline
+    assert res.ok and "completeness" in res.reason.lower()
+    sc["events"][0]["content_hash"] = _ch("evil")   # tamper a shown event
+    assert not verify_sidecar(sc, s).ok
+
+
+# GPG-backed — skips cleanly if gpg / python-gnupg unavailable (repo pattern).
+def test_checkpoint_with_real_gpg():
+    gnupg = pytest.importorskip("gnupg")
+    import os
+    home = "/tmp/wg_cp_gpg"
+    os.makedirs(home, exist_ok=True)
+    os.chmod(home, 0o700)
+    os.environ["GNUPGHOME"] = home
+    g = gnupg.GPG(gnupghome=home)
+    key = g.gen_key(g.gen_key_input(name_email="wg-cp@local", key_type="RSA",
+                                    key_length=2048, no_protection=True))
+    if not getattr(key, "fingerprint", ""):
+        pytest.skip("could not generate a throwaway PGP key in this environment")
+    signer = GpgSigner(str(key.fingerprint), gnupghome=home)
+    led = CustodyLedger()
+    session_record_action(led, "s", "willow", "read")
+    cp = checkpoint(led, signer)
+    assert verify_checkpoint(led, cp, signer).ok
+    led._events[0]["tool"] = "exfiltrate"           # in-place tamper of the sealed event
+    assert not verify_checkpoint(led, cp, signer).ok
