@@ -977,6 +977,22 @@ def test_sidecar_verifies_offline_and_is_weaker():
     assert not verify_sidecar(sc, s).ok
 
 
+def test_sidecar_honesty_label_is_signed():
+    # The weaker-than-ledger label is under the signature: it cannot be flipped
+    # or stripped to silently upgrade a partial slice to look authoritative.
+    led = CustodyLedger()
+    file_create(led, "f", "willow", _ch("v1"))
+    s = _HmacSigner()
+    sc = export_sidecar(led, s, lineage_id="f")
+    assert verify_sidecar(sc, s).ok
+
+    flipped = dict(sc); flipped["authenticity_only"] = False
+    assert not verify_sidecar(flipped, s).ok         # flipping the label breaks the sig
+
+    stripped = {k: v for k, v in sc.items() if k != "authenticity_only"}
+    assert not verify_sidecar(stripped, s).ok         # stripping the label breaks the sig
+
+
 # GPG-backed — skips cleanly if gpg / python-gnupg unavailable (repo pattern).
 def test_checkpoint_with_real_gpg():
     gnupg = pytest.importorskip("gnupg")

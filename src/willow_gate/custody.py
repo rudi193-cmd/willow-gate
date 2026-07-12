@@ -803,20 +803,32 @@ def _recompute_head(events: list, upto_seq: int) -> Optional[str]:
     return prev
 
 
+def _sig_str(sig: Any) -> str:
+    """Normalize a signer's return to a storable str. The contract is
+    ``sign(bytes) -> str``; a bytes return is accepted only if it is text (an
+    ASCII-armored signature, as GpgSigner produces). Non-text bytes fail closed
+    with a clear contract error rather than a raw UnicodeDecodeError."""
+    if isinstance(sig, (bytes, bytearray)):
+        try:
+            return bytes(sig).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(
+                "signer.sign() must return str or text bytes; got non-text bytes")
+    return str(sig)
+
+
 def checkpoint(ledger: CustodyLedger, signer: Any, *, ts: Optional[str] = None) -> dict:
     """Seal the current chain head with a signature and append a checkpoint record.
     The head commits (via the chain) to every event before it, so one signature
     makes the whole prefix tamper-evident at bounded cost. System-only kind."""
     covers = len(ledger) - 1
     head = ledger.head_hash
-    sig = signer.sign(head.encode("utf-8"))
-    if isinstance(sig, (bytes, bytearray)):
-        sig = sig.decode("utf-8")
+    sig = _sig_str(signer.sign(head.encode("utf-8")))
     return ledger._append({
         "kind": KIND_CHECKPOINT,
         "covers_to_seq": covers,
         "head_hash": head,
-        "sig": str(sig),
+        "sig": sig,
     }, ts=ts)
 
 
@@ -859,11 +871,13 @@ def export_sidecar(ledger: CustodyLedger, signer: Any, *,
     else:
         events = [e for e in ledger.events() if e.get("session_id") == session_id]
         subject = {"session_id": session_id}
-    payload = {"subject": subject, "anchor_head": ledger.head_hash, "events": events}
-    sig = signer.sign(canonicalize(payload))
-    if isinstance(sig, (bytes, bytearray)):
-        sig = sig.decode("utf-8")
-    return {**payload, "sig": str(sig), "authenticity_only": True}
+    # authenticity_only lives INSIDE the signed payload so the weaker-than-ledger
+    # honesty label cannot be stripped or flipped while keeping a valid signature
+    # (canonicalize() excludes only `sig`, so every other field is signed).
+    payload = {"subject": subject, "anchor_head": ledger.head_hash, "events": events,
+               "authenticity_only": True}
+    sig = _sig_str(signer.sign(canonicalize(payload)))
+    return {**payload, "sig": sig}
 
 
 def verify_sidecar(sidecar: dict, signer: Any) -> VerifyResult:
@@ -872,9 +886,11 @@ def verify_sidecar(sidecar: dict, signer: Any) -> VerifyResult:
     sig = sidecar.get("sig")
     if not isinstance(sig, str):
         return VerifyResult(False, "malformed sidecar")
-    payload = {k: v for k, v in sidecar.items() if k not in ("sig", "authenticity_only")}
+    # canonicalize() excludes `sig`; every other field — including the
+    # authenticity_only honesty label — is under the signature, so a flipped or
+    # stripped label breaks verification.
     try:
-        ok = bool(signer.verify(canonicalize(payload), sig))
+        ok = bool(signer.verify(canonicalize(sidecar), sig))
     except Exception:
         ok = False
     if not ok:

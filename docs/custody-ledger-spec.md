@@ -188,10 +188,12 @@ signatures, imported lazily so the module stays stdlib-only otherwise).
   within a checkpoint's coverage are caught.
 - `export_sidecar` / `verify_sidecar` sign a portable slice (one lineage or one session) so it can
   be checked **offline, with no ledger present**. The signed payload is `{subject, anchor_head,
-  events}` canonicalized; the returned dict carries `authenticity_only: True` and `verify_sidecar`
-  returns a reason that says so out loud — it proves the shown events are authentic, **not** that
-  none were omitted. It is authenticity, not completeness, and the code refuses to let a caller
-  forget that (see the boundary note below).
+  events, authenticity_only: True}` canonicalized — the `authenticity_only` honesty label is
+  **inside** the signature (canonicalize excludes only `sig`), so it cannot be flipped to `False`
+  or stripped to make a deliberately-partial slice look authoritative without breaking the
+  signature. `verify_sidecar` also returns a reason that says so out loud. It proves the shown
+  events are authentic, **not** that none were omitted — authenticity, not completeness, and the
+  code refuses to let a caller forget that (see the boundary note below).
 
 ---
 
