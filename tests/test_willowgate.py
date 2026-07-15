@@ -60,6 +60,16 @@ def test_checkout(gate):
     assert ok
 
 
+def test_plaintext_ledger_filenames(gate):
+    """Dev ledger files are <nonce>.<kind>.json — the kind appears once."""
+    _, _, s = gate.check_in(hdr(SEC))
+    gate.authorize_tool(s, "read")
+    e = hdr(SEC, timestamp=s["entry_ms"] + 1000, tools=["read"])
+    gate.check_out(s, e)
+    names = sorted(p.name for p in gate.ledger_dir.iterdir())
+    assert names == ["a" * 32 + ".entry.json", "a" * 32 + ".exit.json"]
+
+
 def test_trust_claim_over_ceiling_rejected(gate):
     with pytest.raises(GateError):
         gate.check_in(hdr(SEC, nonce="b" * 32, trust_level=4))
