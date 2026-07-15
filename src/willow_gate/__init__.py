@@ -335,7 +335,7 @@ class WillowGate:
                 raise GateError(f"ledger encryption failed: {enc.status}")
             path.write_bytes(enc.data)
         else:  # explicit opt-out only; still leaves a record
-            path.with_suffix(f".{kind}.json").write_bytes(raw)
+            path.with_suffix(".json").write_bytes(raw)
 
     def _announce(self, session: Dict, msg: str) -> None:
         # HARDENED(5): louder for the less trusted — repeated writes to the log.
