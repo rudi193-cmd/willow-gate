@@ -98,4 +98,4 @@ encrypted ledger encrypts and decrypts.
 
 ## License
 
-MIT
+Apache-2.0

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Minimalist symmetric check-in/check-out gate: trust-tiered access, announce-loud-for-the-untrusted, PGP-encrypted ledger, hard stops."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Sean Campbell" }]
 dependencies = ["python-gnupg>=0.5"]
 
