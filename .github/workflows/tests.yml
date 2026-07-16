@@ -12,6 +12,9 @@ on:
     - cron: "37 6 * * *"
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
