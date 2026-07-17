@@ -45,7 +45,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 try:
     import gnupg  # python-gnupg
@@ -283,6 +283,25 @@ class WillowGate:
         self._announce(session, f"TOOL {tool}{' [export]' if export else ''}")
         return True, "ALLOWED"
 
+    # ── the harness (the wiring that makes PREVENT structural) ────────────────
+
+    def bind_tools(self, session: Dict, tools: List["Tool"]) -> "GatedSession":
+        """Wrap a live session so its tools are ONLY reachable through the gate.
+
+        README's distinction: the gate PREVENTS only when a harness routes every
+        tool call through authorize_tool() BEFORE the tool runs; un-wired it is a
+        loud ledger. This is that wiring. The returned GatedSession holds the
+        callables privately and exposes a single `call()` that authorizes first
+        and refuses (hard stop) if denied — so 'route every call through the
+        gate' stops being a convention the caller has to remember and becomes the
+        only way to invoke a tool at all.
+
+        A denied call raises GateError: the tool never runs, and — because only
+        authorized calls ever reach `session["tools_used"]` — check_out's
+        reconciliation stays exactly true without the caller threading anything
+        by hand."""
+        return GatedSession(self, session, tools)
+
     # ── check-out ─────────────────────────────────────────────────────────────
 
     def check_out(self, session: Dict, exit_data: Dict) -> Tuple[bool, str]:
@@ -344,6 +363,52 @@ class WillowGate:
         with self.announcements_log.open("a") as f:
             for _ in range(_VOLUME_REPEAT.get(vol, 1)):
                 f.write(line)
+
+
+# ─── The harness ─────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class Tool:
+    """A named tool callable bound behind the gate. `export` marks a tool whose
+    invocation exfiltrates data — it is checked against the level's
+    write_export_allowed on every call, exactly as authorize_tool's own
+    `export=` flag is (a read-only level may run a non-export tool it was
+    granted, but never an export one)."""
+    name: str
+    fn: Callable
+    export: bool = False
+
+
+class GatedSession:
+    """A live session with its tools bound behind the gate. The ONLY way to run
+    a tool is `call()`, which authorizes BEFORE invoking. A denied call is a hard
+    stop (GateError) — the tool never runs. This is the object that turns the
+    gate from a ledger into a prevention: the tool callables are held privately,
+    so there is no un-gated path to them."""
+
+    def __init__(self, gate: WillowGate, session: Dict, tools: List[Tool]):
+        self._gate = gate
+        self._session = session
+        self.__tools: Dict[str, Tool] = {t.name: t for t in tools}  # name-mangled
+
+    @property
+    def tools(self) -> Tuple[str, ...]:
+        """The names bound to this session — never the callables themselves."""
+        return tuple(self.__tools)
+
+    def call(self, tool: str, *args, **kwargs):
+        """Authorize `tool`, then invoke it. Raises GateError (hard stop) if the
+        tool is unknown to this harness or the gate denies it — a denied call
+        never reaches the callable, so nothing runs and nothing is recorded as
+        used. On success returns the tool's own return value."""
+        spec = self.__tools.get(tool)
+        if spec is None:
+            raise GateError(f"unknown tool {tool!r} — not bound to this session")
+        ok, msg = self._gate.authorize_tool(self._session, tool, export=spec.export)
+        if not ok:
+            # PREVENT: surface the denial immediately, never run the tool.
+            raise GateError(msg)
+        return spec.fn(*args, **kwargs)
 
 
 if __name__ == "__main__":  # tiny smoke shape (needs a registered agent + key)

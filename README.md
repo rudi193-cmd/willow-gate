@@ -38,8 +38,16 @@ held to the strictest tolerances, not the loosest.
 WillowGate **prevents** only when a harness routes every tool call through
 `authorize_tool()` *before* the tool runs. Wired into a pre-tool hook it is a
 gate: a denied call never executes. Un-wired, it is a loud **ledger** — it
-records and announces, but cannot stop what it is never asked about. Decide
-which one you are building, and wire accordingly.
+records and announces, but cannot stop what it is never asked about.
+
+`gate.bind_tools(session, tools)` is that harness, in-process: it returns a
+`GatedSession` holding the tool callables privately, so `call()` — which
+authorizes *before* invoking and hard-stops a denied call — is the only path to
+a tool. There is no un-gated way to reach the function, so "route every call
+through the gate" stops being a convention you have to remember. Because only
+authorized calls are ever recorded as used, `check_out`'s reconciliation stays
+true for free. Use `bind_tools` for the in-process case; use the raw
+`authorize_tool` when you are wiring your own external pre-tool hook.
 
 The identity binding is **symmetric** (HMAC — the gate holds each agent's
 secret). Asymmetric "agent signs, gate verifies with only a public key" needs
@@ -75,9 +83,24 @@ gate = WillowGate(operator_key_fpr="<your PGP fingerprint>")
 gate.register_agent("R1", secret=b"...32+ bytes...", max_trust=1)
 
 ok, msg, session = gate.check_in(header)                 # 13 fields, HMAC-signed
-allowed, why = gate.authorize_tool(session, "read")      # call before EVERY tool
-ok, msg = gate.check_out(session, exit_header)           # 13 fields, diffed
+
+# Prevention harness: the tools are only reachable through the gate.
+from willow_gate import Tool
+room = gate.bind_tools(session, [
+    Tool("read", read_fn),
+    Tool("write", write_fn),
+    Tool("send", send_fn, export=True),                  # exfiltrates -> export-gated
+])
+page = room.call("read")                                 # authorized, then runs
+# room.call("write") for a read-only level -> GateError, write_fn never runs
+
+ok, msg = gate.check_out(session, exit_header)            # 13 fields, diffed
 ```
+
+Prefer `room.call(...)` when WillowGate is in-process: a denied tool never
+runs, and you never have to remember to call `authorize_tool` first. Drop to
+the raw `gate.authorize_tool(session, "read")` only when you are wiring an
+external pre-tool hook yourself.
 
 For local logic testing without PGP, pass `require_pgp=False` — this writes a
 plaintext ledger and is for development only, never production.
