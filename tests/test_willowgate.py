@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from willow_gate import GateError, WillowGate, _SIGNED_FIELDS
+from willow_gate import GateError, Tool, WillowGate, _SIGNED_FIELDS
 
 SEC = b"rookie-secret-0123456789abcdef01"
 
@@ -309,3 +309,89 @@ def test_checkin_unregistered_agent_rejected(gate):
     registered has no expected signature to compare against -> hard stop."""
     with pytest.raises(GateError, match="unregistered"):
         gate.check_in(hdr(SEC, agent_id="GHOST", nonce="c1" + "0" * 30))
+
+
+# ─── The harness: PREVENT, not just record ───────────────────────────────────
+# bind_tools() wraps a session so the only way to run a tool is call(), which
+# authorizes BEFORE invoking. These assert the difference the README draws
+# between a gate that prevents and a ledger that merely diffs at exit: a denied
+# tool must NEVER run, and an authorized run must reconcile at check-out with no
+# hand-threading.
+
+def test_harness_runs_an_allowed_tool_and_records_it(gate):
+    _, _, s = gate.check_in(hdr(SEC))
+    ran = []
+    h = gate.bind_tools(s, [Tool("read", lambda: ran.append("read") or "page")])
+    assert h.call("read") == "page"
+    assert ran == ["read"]
+    assert "read" in s["tools_used"]        # recorded, so check_out will reconcile
+
+
+def test_harness_prevents_a_denied_tool_the_fn_never_runs(gate):
+    """A Rookie is read-only. Binding a write tool and calling it must hard-stop
+    BEFORE the callable — the side effect must not happen, and nothing is
+    recorded as used."""
+    _, _, s = gate.check_in(hdr(SEC))
+    ran = []
+    h = gate.bind_tools(s, [Tool("write", lambda: ran.append("write"))])
+    with pytest.raises(GateError):
+        h.call("write")
+    assert ran == []                        # the tool never ran
+    assert "write" not in s["tools_used"]   # and nothing was recorded
+
+
+def test_harness_prevents_export_from_a_non_export_level(gate):
+    _, _, s = gate.check_in(hdr(SEC))       # Rookie: write_export_allowed = False
+    ran = []
+    h = gate.bind_tools(s, [Tool("read", lambda: ran.append("x"), export=True)])
+    with pytest.raises(GateError):
+        h.call("read")                      # read clears the grant, export does not
+    assert ran == []
+
+
+def test_harness_unknown_tool_is_a_hard_stop(gate):
+    _, _, s = gate.check_in(hdr(SEC))
+    h = gate.bind_tools(s, [Tool("read", lambda: "ok")])
+    with pytest.raises(GateError, match="unknown tool"):
+        h.call("delete")
+
+
+def test_harness_read_is_universal_even_for_exiled(gate):
+    esec = b"exiled-secret-0123456789abcdef01"
+    gate.register_agent("E0", esec, max_trust=0)
+    _, _, s = gate.check_in(hdr(esec, agent_id="E0", agent_name="ex",
+                                nonce="f" * 32, trust_level=0, tools=["read"]))
+    h = gate.bind_tools(s, [Tool("read", lambda: "readable")])
+    assert h.call("read") == "readable"
+
+
+def test_harness_does_not_expose_the_callables(gate):
+    _, _, s = gate.check_in(hdr(SEC))
+    h = gate.bind_tools(s, [Tool("read", lambda: "secret-fn")])
+    assert h.tools == ("read",)             # names only — no un-gated path to fn
+
+
+def test_harness_makes_checkout_reconcile_end_to_end(gate):
+    """The payoff: a Steady runs read+write ONLY through the harness, and
+    check_out reconciles with no manual authorize_tool calls — the wiring is
+    what keeps 'declared == did' true."""
+    s = steady_session(gate)
+    h = gate.bind_tools(s, [Tool("read", lambda: 1), Tool("write", lambda: 2)])
+    assert h.call("read") == 1
+    assert h.call("write") == 2
+    ok, _ = gate.check_out(s, steady_exit(s, tools=["read", "write"]))
+    assert ok
+
+
+def test_harness_denied_tool_stays_out_of_the_exit_manifest(gate):
+    """Ties the harness to the reconciliation gate: because a prevented write is
+    never recorded as used, a later exit manifest claiming it is still caught as
+    out-of-band — prevention and audit agree."""
+    s = steady_session(gate)
+    h = gate.bind_tools(s, [Tool("read", lambda: 1)])   # write NOT bound
+    h.call("read")
+    with pytest.raises(GateError):
+        h.call("write")                                 # unknown to this harness
+    # an exit manifest that nonetheless claims write is rejected at check_out
+    with pytest.raises(GateError, match="unauthorized"):
+        gate.check_out(s, steady_exit(s, tools=["read", "write"]))
