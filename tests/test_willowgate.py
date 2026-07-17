@@ -157,3 +157,155 @@ def test_pgp_required_fails_closed_without_key(tmp_path):
     pytest.importorskip("gnupg")
     with pytest.raises(GateError):
         WillowGate(base_dir=tmp_path, require_pgp=True, operator_key_fpr="")
+
+
+# ─── Check-out reconciliation (defense-in-depth) ─────────────────────────────
+# The lock is authorize_tool() at the door, but check_out() re-reconciles the
+# exit manifest against the session as a second line. These exercise the two
+# distinct reconciliation checks and the exit-header re-authentication that had
+# no adversarial coverage: an agent that DECLARED one thing and DID another.
+
+SSEC = b"steady-secret-0123456789abcdef01"
+
+
+def steady_session(gate, nonce="2" * 32):
+    """A checked-in Steady session (read+write granted, pass_count satisfied)."""
+    gate.register_agent("S2", SSEC, max_trust=2)
+    _, _, s = gate.check_in(hdr(SSEC, agent_id="S2", agent_name="steady",
+                                nonce=nonce, trust_level=2,
+                                tools=["read", "write"], pass_count=5))
+    return s
+
+
+def steady_exit(s, **over):
+    base = dict(agent_id="S2", agent_name="steady", nonce=s["nonce"],
+                trust_level=2, tools=["read", "write"], pass_count=5,
+                timestamp=s["entry_ms"] + 1000)
+    base.update(over)
+    return hdr(SSEC, **base)
+
+
+def test_checkout_declared_read_did_write_rejected(gate):
+    """The flagship adversary: a read-only Rookie declares only `read` at entry,
+    then presents an exit manifest claiming it used `write`. The exit tool is
+    not in the session grant -> out-of-band tool use."""
+    _, _, s = gate.check_in(hdr(SEC))          # Rookie, tools=["read"]
+    gate.authorize_tool(s, "read")
+    e = hdr(SEC, timestamp=s["entry_ms"] + 1000, tools=["read", "write"])
+    with pytest.raises(GateError, match="out-of-band"):
+        gate.check_out(s, e)
+
+
+def test_checkout_rejects_tool_granted_but_never_authorized(gate):
+    """`write` IS in a Steady's grant, but it was never cleared through
+    authorize_tool() during the session, so an exit manifest listing it is a
+    call that bypassed the door."""
+    s = steady_session(gate)
+    gate.authorize_tool(s, "read")             # read only — write never authorized
+    e = steady_exit(s, tools=["read", "write"])
+    with pytest.raises(GateError, match="unauthorized"):
+        gate.check_out(s, e)
+
+
+def test_checkout_properly_authorized_write_passes(gate):
+    """Positive control: a Steady that actually cleared read AND write through
+    the door checks out clean with both in the exit manifest."""
+    s = steady_session(gate)
+    gate.authorize_tool(s, "read")
+    gate.authorize_tool(s, "write")
+    ok, _ = gate.check_out(s, steady_exit(s, tools=["read", "write"]))
+    assert ok
+
+
+def test_checkout_forged_exit_signature_rejected(gate):
+    """The exit header is signed too — a forged exit signature is refused even
+    though every immutable field matches the entry."""
+    _, _, s = gate.check_in(hdr(SEC))
+    gate.authorize_tool(s, "read")
+    e = hdr(SEC, timestamp=s["entry_ms"] + 1000, tools=["read"])
+    e["signature"] = "f" * 64
+    with pytest.raises(GateError, match="signature"):
+        gate.check_out(s, e)
+
+
+def test_checkout_immutable_field_tamper_rejected(gate):
+    """A pinned identity field (here trust_level) that differs between entry and
+    exit is rejected before anything else — trust cannot be re-declared on the
+    way out."""
+    _, _, s = gate.check_in(hdr(SEC))
+    gate.authorize_tool(s, "read")
+    e = hdr(SEC, timestamp=s["entry_ms"] + 1000, tools=["read"], trust_level=4)
+    with pytest.raises(GateError, match="does not match entry"):
+        gate.check_out(s, e)
+
+
+def test_checkout_exit_before_entry_rejected(gate):
+    _, _, s = gate.check_in(hdr(SEC))
+    gate.authorize_tool(s, "read")
+    e = hdr(SEC, timestamp=s["entry_ms"], tools=["read"])   # not strictly after
+    with pytest.raises(GateError, match="after entry"):
+        gate.check_out(s, e)
+
+
+def test_checkout_pass_count_decrease_rejected(gate):
+    s = steady_session(gate)
+    gate.authorize_tool(s, "read")
+    e = steady_exit(s, tools=["read"], pass_count=4)         # entry was 5
+    with pytest.raises(GateError, match="pass_count"):
+        gate.check_out(s, e)
+
+
+def test_checkout_fail_count_decrease_rejected(gate):
+    s = steady_session(gate)
+    gate.authorize_tool(s, "read")
+    # Entry fail_count defaulted to 0; a negative exit count is a decrease.
+    e = steady_exit(s, tools=["read"], fail_count=-1)
+    with pytest.raises(GateError, match="fail_count"):
+        gate.check_out(s, e)
+
+
+# ─── Check-in shape and gate coverage ────────────────────────────────────────
+
+def test_checkin_tools_exceed_grant_rejected(gate):
+    """A Rookie declaring a tool above its ceiling (`execute`) is refused at the
+    door, before any session exists."""
+    with pytest.raises(GateError, match="exceed"):
+        gate.check_in(hdr(SEC, nonce="7" * 32, tools=["execute"]))
+
+
+def test_checkin_missing_field_rejected(gate):
+    """The '13 in' half of the symmetry: a dropped field is refused."""
+    h = hdr(SEC, nonce="8" * 32)
+    del h["drift"]
+    with pytest.raises(GateError, match="missing fields"):
+        gate.check_in(h)
+
+
+def test_checkin_extra_field_rejected(gate):
+    """The other half: an unexpected 14th field is refused."""
+    h = hdr(SEC, nonce="9" * 32)
+    h["extra"] = "smuggled"
+    with pytest.raises(GateError, match="unknown fields"):
+        gate.check_in(h)
+
+
+def test_checkin_min_pass_count_gate(gate):
+    """Steady requires a minimum earned pass_count; too low is refused even with
+    a valid signature and an in-ceiling trust claim."""
+    gate.register_agent("S2", SSEC, max_trust=2)
+    with pytest.raises(GateError, match="pass_count"):
+        gate.check_in(hdr(SSEC, agent_id="S2", agent_name="steady",
+                          nonce="a1" + "0" * 30, trust_level=2,
+                          tools=["read", "write"], pass_count=0))
+
+
+def test_checkin_max_fail_count_gate(gate):
+    with pytest.raises(GateError, match="fail_count"):
+        gate.check_in(hdr(SEC, nonce="b1" + "0" * 30, fail_count=6))
+
+
+def test_checkin_unregistered_agent_rejected(gate):
+    """A well-formed, plausibly-signed header for an agent the gate never
+    registered has no expected signature to compare against -> hard stop."""
+    with pytest.raises(GateError, match="unregistered"):
+        gate.check_in(hdr(SEC, agent_id="GHOST", nonce="c1" + "0" * 30))
