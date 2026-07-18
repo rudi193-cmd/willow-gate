@@ -92,11 +92,21 @@ def test_drift_over_limit_rejected(gate):
         gate.check_in(hdr(SEC, nonce="e" * 32, drift=6000))
 
 
-def test_exiled_read_only_room(gate):
+def test_exiled_refused_at_check_in(gate):
+    # willow-gate#12: entry_allowed=False for Exiled is now ENFORCED — level 0 may
+    # not open a session at all (this is what distinguishes it from Rookie). Read
+    # stays universal, but for a true outsider it is not gate-mediated: an Exiled
+    # agent never checks in, so it holds no session.
     esec = b"exiled-secret-0123456789abcdef01"
     gate.register_agent("E0", esec, max_trust=0)
-    ok, _, s = gate.check_in(hdr(esec, agent_id="E0", agent_name="ex",
-                                 nonce="f" * 32, trust_level=0, tools=["read"]))
+    with pytest.raises(GateError, match="entry denied"):
+        gate.check_in(hdr(esec, agent_id="E0", agent_name="ex",
+                          nonce="f" * 32, trust_level=0, tools=["read"]))
+
+
+def test_rookie_still_gets_a_read_only_session(gate):
+    # The next level up is unaffected: Rookie enters and gets a read-only room.
+    ok, _, s = gate.check_in(hdr(SEC, nonce="9" * 32))
     assert ok
     assert gate.authorize_tool(s, "read")[0]        # read is universal
     assert not gate.authorize_tool(s, "write")[0]   # but nothing else
@@ -356,11 +366,10 @@ def test_harness_unknown_tool_is_a_hard_stop(gate):
         h.call("delete")
 
 
-def test_harness_read_is_universal_even_for_exiled(gate):
-    esec = b"exiled-secret-0123456789abcdef01"
-    gate.register_agent("E0", esec, max_trust=0)
-    _, _, s = gate.check_in(hdr(esec, agent_id="E0", agent_name="ex",
-                                nonce="f" * 32, trust_level=0, tools=["read"]))
+def test_harness_read_is_universal_for_a_session_holder(gate):
+    # Read clears the grant check for anyone WITH a session (willow-gate#12: an
+    # outsider/Exiled has no session, so gate-mediated read starts at Rookie).
+    _, _, s = gate.check_in(hdr(SEC, nonce="7" * 32))
     h = gate.bind_tools(s, [Tool("read", lambda: "readable")])
     assert h.call("read") == "readable"
 
