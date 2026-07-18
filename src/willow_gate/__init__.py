@@ -24,9 +24,12 @@ each is marked `# HARDENED` at its site so you can find and judge it:
   5. `blast_radius` -> `announcement_volume`. It means audit loudness — the
      inverse of the standard term (where minimizing blast radius is the goal).
      The rename stops the misread.
-  6. The Exiled contradiction is resolved. Read is universal (even outsiders,
-     per your principle). `entry_allowed` governs *write* sessions only, so an
-     Exiled agent gets a read-only session instead of a paradox.
+  6. The Exiled contradiction is resolved (willow-gate#12). `entry_allowed` gates
+     session CREATION: Exiled (level 0) is REFUSED at check_in and holds no
+     session — that is what makes it distinct from Rookie (both are otherwise
+     read-only). Read is still universal, but for a true outsider it is not
+     gate-mediated: an outsider never checks in, so a session-bearing read is a
+     Rookie+ affair and an outsider reads by a path the gate never mediated.
   7. Tolerance no longer rewards power with slack. drift/fail budgets TIGHTEN as
      trust rises (Elder is held tightest), the reverse of the draft. This is a
      constant table — revert it if you meant it the other way.
@@ -58,7 +61,9 @@ except Exception:  # pragma: no cover - optional at import time, required at run
 @dataclass(frozen=True)
 class TrustLevel:
     name: str
-    entry_allowed: bool          # may open a *write* session (read is universal)
+    entry_allowed: bool          # may open a session at all (willow-gate#12);
+                                 # Exiled=False is refused at check_in. read is
+                                 # universal but session-less for a true outsider.
     read_only: bool
     write_export_allowed: bool
     announcement_volume: str     # HARDENED(5): was blast_radius; = audit loudness
@@ -214,6 +219,17 @@ class WillowGate:
         self._validate_shape(header)
         trust = self._authenticate(header)
         level = TRUST_LEVELS[trust]
+
+        # entry_allowed gates session creation (willow-gate#12). Exiled (level 0)
+        # is REFUSED a session — it is the one level that may not check in. "Read
+        # is universal" still holds, but for a true outsider it is NOT gate-
+        # mediated: an Exiled agent never obtains a session, so a session-bearing
+        # read is a Rookie+ affair; an outsider reads by a path the gate never
+        # claimed to mediate. This is the field's namesake meaning, and it is what
+        # makes Exiled distinct from Rookie (both are otherwise read-only).
+        if not level.entry_allowed:
+            raise GateError(
+                f"entry denied: {level.name} (level {trust}) may not open a session")
 
         if level.max_drift_ms is not None and abs(int(header["drift"])) > level.max_drift_ms:
             raise GateError(f"drift {header['drift']}ms exceeds {level.max_drift_ms}ms")

@@ -16,15 +16,18 @@ HMAC over the header keyed by a per-agent secret the gate holds, and a claimed
 `trust_level` is capped at the agent's registered ceiling. "Elder" is not a
 text field anyone can type.
 
-Read is universal — even an outsider (Exiled) may read, loudly. What outsiders
-cannot do is *take information anywhere else*: export/exfiltration is gated, and
-the lower the trust, the louder every action is announced.
+Read is universal — but for a true outsider it is *not gate-mediated*. Exiled
+(level 0) is **refused a session at check-in** (`entry_allowed=False`); it is the
+one level that may not enter. An outsider still reads, loudly, by a path the gate
+never claimed to mediate — what it cannot do is *take information anywhere else*:
+export/exfiltration is gated, and the lower the trust, the louder every action is
+announced. A session-bearing read is a Rookie+ affair.
 
 ## Trust levels
 
 | Level | Name | Session | Export | Announcement | Tools |
 |---|---|---|---|---|---|
-| 0 | Exiled | read-only | ❌ | maximum | read |
+| 0 | Exiled | **none — refused at check-in** | ❌ | maximum | read (session-less) |
 | 1 | Rookie | read-only | ❌ | large | read |
 | 2 | Steady | read + write | ✅ | medium | read, write |
 | 3 | Veteran | read + write | ✅ | small | + query, execute |
@@ -115,7 +118,7 @@ pytest
 Covers trust binding, the registered ceiling cap, inline `authorize_tool`
 prevention, export denial, nonce replay (including across a restart, via the
 persistent nonce store), the reserved trap field, drift limits, the
-read-universal / Exiled-read-only rule, and symmetric check-out. A separate
+Exiled entry-refusal (`entry_allowed`), and symmetric check-out. A separate
 PGP round-trip test (skipped if `gpg`/`python-gnupg` are unavailable) proves the
 encrypted ledger encrypts and decrypts.
 
