@@ -261,7 +261,9 @@ def _validate_ts(ts: Any) -> None:
     if not isinstance(ts, str):
         raise ValueError(f"ts must be an ISO-8601 string: {ts!r}")
     try:
-        dt = datetime.fromisoformat(ts)
+        # Python < 3.11's fromisoformat rejects the 'Z' zone designator; the
+        # stored form keeps 'Z', only validation normalizes it.
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
         raise ValueError(f"ts must be ISO-8601: {ts!r}")
     if dt.tzinfo is None:
