@@ -65,19 +65,44 @@ One canonical JSON object per event. Fields:
 | `note` | freeform. |
 | `sig` | detached PGP signature over this event's canonical bytes (Tier 4). |
 
-**Redaction is fail-closed:** the writer refuses to persist an event whose `gate.auth_ref` or any
-field matches a secret pattern (key/token/secret/password). A crossing is recorded as *having
-happened, under which credential id* — never with the credential.
-**Gate:** a unit test submits an event carrying a live-looking token; the writer rejects it and
-writes nothing.
+**Redaction is fail-closed** and refuses to persist an event carrying, anywhere in it, (a) a string
+**value** of a known live-credential shape (AWS/GitHub/Slack/Google/JWT/PEM), (b) a dict **key** of
+such a shape, or (c) **any non-empty string leaf — even wrapped in a list or nested dict** — under a
+field **name** that implies a raw secret (`password`/`api_key`/`private_key`/`client_secret`/
+`session_token`/`access_token`/`refresh_token`/`id_token`/`bearer`/… **and any `*_token` field**). A
+small allowlist of pagination cursors (`next_token`, `page_token`, `next_page_token`,
+`continuation_token`) is exempt from the `*_token` rule, and the bare `token`/`cookie` names are not
+triggers — they false-positive on cursors and UI cookies. Reference and identifier fields are
+**exempt** — `auth_ref`, `*_id`,
+`*_ref`, `*_hash`, `*_fingerprint`, `*_name` — so a crossing is still recorded as *having happened,
+under which credential id*, never with the credential. Ambiguous generic names (`secret`,
+`credential`, `credentials`) are deliberately **not** triggers: they false-positive on credential
+*ids*, so a plaintext secret under a bare `secret` field is caught only if its *value* has a
+credential shape. Redaction is deliberately **incomplete** (no generic-entropy heuristic — a secret
+shaped like a content hash is indistinguishable from one and passes); it fails closed on what it
+recognizes — extend the patterns, never loosen the default.
+**Gate:** a live token, a plaintext `password`/`api_key`/`bearer`, a list/dict-wrapped secret under
+a secret field, and a secret-shaped key are each rejected and write nothing; `auth_ref`/`*_id`/
+`*_hash` values and a legit `credentials: <id>` pass.
+
+**System-only kinds.** `session.checkout` and `capture_gap` are *derived* records — they are the
+ledger's own conclusions, not receipts a caller supplies. The public `append()` **refuses** them; only
+`check_out()` and `detect_capture_gap()` emit them, through a privileged internal path. Otherwise an
+agent could append its own `{"kind":"session.checkout","reconciled":true}` and either forge a clean
+record or deny the real reconciliation. A derived record must not be forgeable by the party it judges.
 
 ## Canonicalization (or the chain and the signatures mean nothing)
 
-Every hash and signature is computed over a **canonical serialization**: sorted keys, UTF-8, no
-insignificant whitespace, integers not floats, explicit null policy. Two independent serializers
-must produce byte-identical output.
-**Gate:** `test_canonical_form_is_byte_stable` — an event round-tripped through two serializers
-hashes identically; reordering input keys does not change the hash.
+Every hash and signature is computed over a **canonical serialization**: **string keys only**
+(a non-string key is rejected, not coerced — `True`/`1` must not collide with `"true"`/`"1"`),
+**NFC-normalized** strings and keys, **no floats** (integers-only; `NaN`/`Inf` aren't valid JSON),
+sorted keys, `sig` excluded, `None` values omitted, **ASCII-escaped** (`ensure_ascii`) so no
+UTF-8-vs-`\uXXXX` divergence, no insignificant whitespace. Any conforming serializer reproduces
+identical bytes. An uncanonicalizable event (non-string key, float) is refused by `append()` before
+anything is written — canonicalization is itself a fail-closed gate.
+**Gate:** the canonical form is pure ASCII and a **fixed point** across a JSON round-trip
+(`test_canon_portable_ascii_nfc_and_fixed_point`); a combining-form string collapses to its
+precomposed form; non-string keys and floats raise (`test_canon_rejects_non_string_keys_and_floats`).
 
 ---
 
@@ -87,18 +112,53 @@ The deliverable H5 names. On session close:
 
 1. Read the `session.checkin` event's `declared` header (WillowGate 13 fields: declared tools,
    scopes, egress intent, trust level claimed).
-2. Fold the session's `session.action` events into `observed` — the set of capabilities actually
-   exercised (tools called, scopes touched, gates crossed).
+2. Fold **every** capability-bearing event tagged with this `session_id` into `observed` — not just
+   `session.action`: `file.write`/`file.create` is a `write`, `file.read` is a `read`,
+   `file.gate_cross` is an `egress`, `file.checkout` (a file leaving custody) is its **own**
+   `checkout` capability — *not* folded into `egress`, or declaring one would excuse the other — and
+   an untyped `session.action` still counts (as `action`). Folding only `session.action.tool` — or
+   leaving any capability kind out of the map — is an evasion; the write just routes through that
+   path. Capability names are **case-folded** so `Write`/`write` can neither evade nor false-flag.
 3. Diff `declared` vs `observed`. Any capability exercised but **not** declared → a
    reconciliation **mismatch**.
-4. Emit `session.checkout` with `{reconciled: bool, mismatches: [...], fail_count_delta}`. Feed
+4. Emit `session.checkout` (system-only) with `{reconciled, mismatches, fail_count_delta}`. Feed
    `fail_count` to the trust ladder; land the record where a human sees it.
 
+**Windowing & idempotence.** Actions before the first check-in fold into the first window (a
+capability exercised and *then* narrowly declared is still caught). A *fresh* window opens **only on
+a check-in that follows a check-out**; a re-check-in inside an open window is ignored — it can
+neither reset `observed` nor re-broaden `declared`. Capabilities exercised in the **dead zone** —
+after a check-out, before the next check-in — are not discarded either: they carry into the next
+window's `observed`, so a capability slipped in between windows and then narrowly re-declared is
+still caught (the symmetric twin of the pre-first-check-in fold). `check_out` **never raises** on an
+already-closed window: it recomputes the true reconciliation from the window's actions and returns it.
+`already_closed` is True (and the emit is skipped) **only** when the window was closed *and* nothing
+new happened since the last check-out. Capabilities exercised in the trailing dead zone (after a
+check-out, no new check-in) are **new activity**: they emit a durable check-out and feed the ladder,
+and only a re-check_out with genuinely nothing new is idempotent.
+
+**The Tier-4 boundary (stated honestly — the docs must not lie).** `check_out`'s recompute-don't-raise
+defeats a *lone* forged `session.checkout`: it can neither deny nor mask. It does **not** fully close
+forgery, and an earlier draft of this spec wrongly claimed it did. Because `load()` cannot re-run the
+system-only guard (or no genuine saved record could reload), a file-writing adversary can still,
+against a *loaded* ledger:
+  * **mask a mismatch** with a forged `session.checkout` **followed by** a forged `session.checkin`
+    — the pair rolls the window forward and drops the real window's actions;
+  * **suppress the ladder feed** by spoofing `already_closed=True` on the first genuine check-out —
+    so `already_closed` is *advisory*, not trustworthy against a tampered file;
+  * **launder a lineage** with a forged `capture_gap` that a later `file.write` then chains onto.
+None of these is fixable at this tier: authenticating *which derived records are the ledger's own*
+against a party who can rewrite the file is exactly what the **Tier-4 signed head** provides. Until
+Tier 4, treat every `session.checkout`/`capture_gap` in an untrusted file as **unauthenticated**, and
+rely on H5 only for a ledger you wrote yourself in-process. Documented-limit tests assert each of
+these, so the boundary is pinned, not assumed.
+
 **Gate (H5's own):** an agent that check-in-declares `tools:[read]` then writes is caught at
-check-out with a reconciliation failure; the mismatch is a durable ledger entry, and the trust
-ladder's `fail_count` increments. Reconciliation is over **observable capabilities**, not
-semantic intent — it catches "declared read, did write," not "read the wrong thing for a bad
-reason." (That deeper case is H6; it does not live here, on purpose.)
+check-out with a reconciliation failure — whether the write is a `session.action`, a session-tagged
+`file.write`/`file.gate_cross`, or an untyped action; the mismatch is a durable ledger entry, and
+the trust ladder's `fail_count` increments (once). Reconciliation is over **observable
+capabilities**, not semantic intent — it catches "declared read, did write," not "read the wrong
+thing for a bad reason." (That deeper case is H6; it does not live here, on purpose.)
 
 ## Signing strategy (tamper-evidence without paying per event)
 
@@ -106,17 +166,73 @@ Hash-chaining every event is cheap and gives ordering + tamper-*detection*. PGP-
 event is expensive. So: **hash-chain every event; PGP-sign periodic checkpoints** — a signed head
 hash (a Merkle root over the events since the last checkpoint) at every session close or every N
 events. That makes the whole chain tamper-*evident* under the operator's key at bounded cost.
-**Gate:** altering any past event breaks chain verification; altering an event before a signed
-checkpoint additionally fails the checkpoint signature.
+**Gate:** an *in-place* alteration of any past event breaks chain verification; a re-derived-chain
+forgery or a tail-truncation is caught *only* by the checkpoint signature (see the boundary below).
+
+**As built.** The signer is deliberately signer-agnostic: the core wants only `sign(data:
+bytes) -> str` and `verify(data: bytes, sig: str) -> bool`, so tests can drive it with a
+deterministic HMAC signer and production uses `GpgSigner` (python-gnupg, detached ASCII
+signatures, imported lazily so the module stays stdlib-only otherwise).
+
+- `checkpoint(ledger, signer)` reads the current chain head, signs *the head hash itself* (not
+  every event — the head already commits to the whole prefix through the chain), and appends a
+  `checkpoint` event carrying `covers_to_seq`, `head_hash`, and the detached `sig`. `checkpoint`
+  is a **system-only kind**: public `append()` refuses it; only the privileged `_append()` emits
+  it. The checkpoint seals the prefix *before* itself — it is not in its own coverage.
+- `verify_checkpoint(ledger, ev, signer)` **recomputes** the head over `events[0..covers_to_seq]`
+  and fails if the chain is broken there, if the recomputed head ≠ the claimed `head_hash`, or if
+  the signature over the claimed head does not verify. This is what closes the Tier-1 boundary: a
+  re-derived-chain forgery changes the recomputed head, so it fails here even though bare Tier-1
+  `verify()` accepts it; and if the attacker also rewrites the stored head to match their forgery,
+  the signature over it no longer verifies (they lack the key). Both truncation and re-derivation
+  within a checkpoint's coverage are caught.
+- `export_sidecar` / `verify_sidecar` sign a portable slice (one lineage or one session) so it can
+  be checked **offline, with no ledger present**. The signed payload is `{subject, anchor_head,
+  events, authenticity_only: True}` canonicalized — the `authenticity_only` honesty label is
+  **inside** the signature (canonicalize excludes only `sig`), so it cannot be flipped to `False`
+  or stripped to make a deliberately-partial slice look authoritative without breaking the
+  signature. `verify_sidecar` also returns a reason that says so out loud. It proves the shown
+  events are authentic, **not** that none were omitted — authenticity, not completeness, and the
+  code refuses to let a caller forget that (see the boundary note below).
 
 ---
 
 ## What it does NOT do (do not overclaim)
 
+- **Tier 1 catches in-place tamper, not re-derivation.** The hash chain detects an in-place edit
+  (every later `ledger_prev_hash` stops matching). It does **not** catch an attacker who rewrites a
+  past event *and* re-derives every subsequent `ledger_prev_hash` — that forms a self-consistent
+  chain `verify()` accepts — nor a tail-truncation. Nothing at Tier 1 pins the head. Only the
+  **Tier-4 checkpoint signature** commits the head externally and makes those tamper-*evident*.
+  Both limits are asserted by documented-limit tests so the boundary is pinned, not assumed.
+- **`load()` fails closed on *every* invariant, not just the chain.** Re-opening a ledger re-runs
+  `verify()` (chain + seq) **and** re-applies the secret scan, the legal-kind check, and the tz-aware
+  `ts` check to every event, raising on any violation — otherwise a hand-built valid-chain file could
+  smuggle a secret, a bogus kind, or a bad `ts` that `append()` would have refused. The file is data,
+  not authority. (It still cannot catch a fully re-derived forgery without the Tier-4 head.)
 - **It witnesses; it does not prevent.** A file edited by a tool that emits no event is not
   blocked — it is *detected*: the next observed `content_hash` won't match the chained
   `parent_content_hash`, and a `capture_gap` event is written. Detection is the value (the
   friction floor, for data), but it is not prevention. Never call it a wall.
+- **`capture_gap` detects honest reporting, not an adversary who owns the recorder.** It fires only
+  when an observed hash is reported *before* a write is recorded. An actor who controls the write
+  path can launder an out-of-band edit as a normal `file_write` and no gap is raised — that case is
+  caught (if at all) by routing the write through the gate (Tier 3b) and by H5 reconciliation, not
+  by the detector. A lineage with no origin (`file.create`/`file.gate_cross` first) does not verify.
+- **Only the first origin, writes, and acknowledged gaps move the lineage baseline.** A `file.read`
+  never re-baselines; a read of a hash the lineage has **never held** fails `verify_lineage` (an
+  out-of-band change can't be laundered as a read), while a read of any *previously-held* version (a
+  cached/older copy) is fine. A **second** `file.create`/`file.gate_cross` may not re-anchor the
+  lineage onto a new hash (fails as a conflicting second origin — the cheap Tier-2 guard against the
+  second-origin variant of the recorder-controlled launder). A `file.write` with no `content_hash`
+  fails. `last_content_hash` advances only on the *first* origin, writes, and an acknowledged gap.
+- **A capability event with no (or a mis-typed) `session_id` is not reconciled.** H5 can only fold
+  events tagged with the session; an untagged `file.checkout`/`file.write`/etc. is unattributable and
+  escapes the check. `session_id` is a **string by contract** — a non-string is refused, so distinct
+  sessions can't merge (no `1`/`"1"` coalescing) and a mis-typed tag can't split a window; but a
+  `None` or otherwise absent tag is still unattributable. This is the **Tier-3b hook's duty**: it must inject
+  the *active* `session_id` on every capability event, so a raw untagged call is outside
+  reconciliation by construction, not a gap the core can close alone.
 - **Completeness = capture points.** The ledger is only as complete as the hooks that feed it.
   Every unexplained hash jump must surface as `capture_gap` — silence must never read as "nothing
   happened."
@@ -148,8 +264,11 @@ This is assembly, not invention.
 3. **Tier 3 — file custody.** `file.*` events wired into the pre-tool hook and the integrations
    egress lane; lineage chain; diff capture; `capture_gap` on unexplained jumps. *Gate:* a file's
    full lineage is queryable start to finish; an out-of-band edit shows as a `capture_gap`.
-4. **Tier 4 — sealing.** PGP checkpoint signing + the portable signed sidecar. *Gate:* a tampered
-   event fails signature verification; a sidecar verifies offline and is labeled weaker-than-ledger.
+4. **Tier 4 — sealing.** PGP checkpoint signing (sign the chain head) + the portable signed
+   sidecar. *Gate:* within a checkpoint's coverage a re-derived-chain forgery **and** a
+   tail-truncation both fail `verify_checkpoint` (which bare Tier-1 `verify()` cannot catch); a
+   rewritten head fails the signature; the `checkpoint` kind is refused by public `append()`; a
+   sidecar verifies offline and is labeled `authenticity_only` (weaker than the ledger).
 
 ## Open questions (decide / test before building past Tier 2)
 
