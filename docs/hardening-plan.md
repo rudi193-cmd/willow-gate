@@ -26,7 +26,7 @@ deterministic pre-execution gates and they exist. The plan below is the gaps onl
 
 ## TIER 1 — enforceable now, no research blocker
 
-### H1. ASI07 — Inter-agent comm integrity (weakest coverage)
+### H1. ASI07 — Inter-agent comm integrity — ✅ BUILT 2026-07-22 (Ed25519)
 **Gap:** Grove messages carry a `sender` field, not a cryptographic binding. A forged
 `sender=hanuman` on the Postgres bus is currently plausible; dispatch envelopes are addressed
 but not signed.
@@ -45,6 +45,8 @@ key it can read. HMAC is correct only under a **single trusted-broker** topology
 verifier). For true agent-to-agent authenticity, re-scope to **per-agent asymmetric signatures**
 (Ed25519: sign with private, verify with public, no verifier can forge). Decide topology before
 building; "no new crypto" is the convenient choice, not necessarily the correct one.
+
+**Resolution (2026-07-22):** topology decided **Ed25519** (asymmetric), per the caveat's own conclusion — Grove is a shared multi-reader bus, so symmetric HMAC would let any verifier forge any peer. Shipped as `src/willow_gate/message_integrity.py`: `sign_message` / `MessageVerifier` with a public-key registry, persistent nonce burn (survives restart), a 24h freshness window, and explicit-only key rotation. 13 tests in `tests/test_message_integrity.py` cover the named gate (forged `sender=hanuman` rejected), altered body/channel, replay, unknown/unsigned sender, JSON round-trip, 0600 key custody, and the asymmetric no-forging property. Wiring the Grove send/receive edge to call these is the follow-up (grove_db.py lives in safe-app-willow-grove).
 
 ### H2. ASI05 — Egress authorization is a regex (B-37, known hole)
 **Gap:** `allow_net` / network egress is decided by a string scan over raw task text — no
@@ -213,8 +215,7 @@ events raises an alert rather than silently degrading reconciliation.
 ---
 
 ## Sequencing
-1. **H1** (Grove integrity) — smallest, closes the weakest gap. Decide HMAC-broker vs Ed25519
-   topology first (see caveat); ship after that call.
+1. ~~**H1** (Grove integrity)~~ — ✅ BUILT 2026-07-22 (Ed25519). Library shipped + tested; Grove-edge wiring is the remaining integration step.
 2. **H2** (egress lease) — coordinate with willow-mcp decommission Phase-1 cutover.
 3. **Custody ledger Tier 1–2** (`docs/custody-ledger-spec.md`) — the spine + `check_out()`. This
    *is* **H5**, and its provenance fields *are* **H3**. Build here; H3 and H5 fall out.
