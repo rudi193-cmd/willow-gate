@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Sean Campbell" }]
-dependencies = ["python-gnupg>=0.5"]
+dependencies = ["python-gnupg>=0.5", "cryptography>=41"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
