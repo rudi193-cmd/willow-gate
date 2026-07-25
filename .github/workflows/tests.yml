@@ -35,7 +35,7 @@ jobs:
       - name: Bandit (enforced — tree is clean, keep it that way)
         run: bandit -r src -ll -q
 
-  test:
+  test-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -59,3 +59,11 @@ jobs:
       - name: Run tests
         # python-gnupg wraps the gpg binary; ubuntu runners ship it.
         run: python -m pytest tests/ -q
+
+  # Aggregate gate: branch protection requires a single check named "test"
+  # across the whole fleet. Green only when lint and every matrix leg are.
+  test:
+    needs: [test-matrix, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "lint and all matrix legs green"
