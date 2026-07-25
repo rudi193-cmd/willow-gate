@@ -60,6 +60,34 @@ def test_checkout(gate):
     assert ok
 
 
+def test_forged_session_dict_cannot_elevate(gate):
+    # Box audit willow-gate B1: authorize_tool trusted caller-supplied fields.
+    ok, _, s = gate.check_in(hdr(SEC))              # Rookie: read-only
+    assert ok and not gate.authorize_tool(s, "write")[0]
+
+    # An attacker holds the returned dict and rewrites its trust fields.
+    forged = dict(s)
+    forged["trust_level"] = 4
+    forged["granted_tools"] = {"read", "write", "admin"}
+    forged["writable"] = True
+
+    # Still denied — authorization reads the server-side session, not the copy.
+    assert not gate.authorize_tool(forged, "write")[0]
+    assert not gate.authorize_tool(forged, "admin", export=True)[0]
+    # And the tamper didn't leak into the real session's bookkeeping.
+    assert gate.sessions[s["nonce"]]["granted_tools"] == {"read"}
+
+
+def test_double_checkout_fails_closed(gate):
+    # Box audit willow-gate B6: a second check-out KeyError'd instead of GateError.
+    _, _, s = gate.check_in(hdr(SEC))
+    gate.authorize_tool(s, "read")
+    e = hdr(SEC, timestamp=s["entry_ms"] + 1000, tools=["read"])
+    assert gate.check_out(s, e)[0]
+    with pytest.raises(GateError):
+        gate.check_out(s, e)
+
+
 def test_plaintext_ledger_filenames(gate):
     """Dev ledger files are <nonce>.<kind>.json — the kind appears once."""
     _, _, s = gate.check_in(hdr(SEC))

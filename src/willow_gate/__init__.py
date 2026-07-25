@@ -282,21 +282,28 @@ class WillowGate:
                        ) -> Tuple[bool, str]:
         """HARDENED(1): call this BEFORE every tool use. It PREVENTS — a denied
         call never runs. This is the difference between a gate and a ledger."""
-        if session["nonce"] not in self.sessions:
+        # The caller-passed dict identifies the session by nonce ONLY; every
+        # trust decision reads the authoritative server-side session, so a forged
+        # or mutated copy (trust_level bumped, granted_tools widened) cannot
+        # elevate — the tampered fields are never consulted. The membership test
+        # alone was the bug: it authorized off caller-controlled state (box audit
+        # willow-gate B1). Mirrors willow-mcp/session_binder's server-side model.
+        real = self.sessions.get(session.get("nonce") if isinstance(session, dict) else None)
+        if real is None:
             raise GateError("no live session for this nonce")
-        level = TRUST_LEVELS[session["trust_level"]]
+        level = TRUST_LEVELS[real["trust_level"]]
         # HARDENED(6): read clears the grant check for everyone; export is still
         # enforced below regardless of which tool it is.
-        if tool != READ_TOOL and tool not in session["granted_tools"]:
-            self._announce(session, f"BLOCKED tool={tool} (not granted)")
+        if tool != READ_TOOL and tool not in real["granted_tools"]:
+            self._announce(real, f"BLOCKED tool={tool} (not granted)")
             return False, f"DENIED — {tool!r} not in this session's grant"
         if export and not level.write_export_allowed:
-            self._announce(session, f"BLOCKED export tool={tool} (trust {level.name})")
+            self._announce(real, f"BLOCKED export tool={tool} (trust {level.name})")
             return False, f"DENIED — {level.name} may not export/exfiltrate"
-        session["tools_used"].add(tool)
+        real["tools_used"].add(tool)
         if export:
-            session["exports"] += 1
-        self._announce(session, f"TOOL {tool}{' [export]' if export else ''}")
+            real["exports"] += 1
+        self._announce(real, f"TOOL {tool}{' [export]' if export else ''}")
         return True, "ALLOWED"
 
     # ── the harness (the wiring that makes PREVENT structural) ────────────────
@@ -322,12 +329,20 @@ class WillowGate:
 
     def check_out(self, session: Dict, exit_data: Dict) -> Tuple[bool, str]:
         self._validate_shape(exit_data)
-        entry = session["entry"]
+        # Authoritative server-side session — a forged/mutated caller dict, or a
+        # second check-out after the session was already removed, is refused here
+        # rather than trusted or crashing with an uncaught KeyError (box audit
+        # willow-gate B1 forgery + B6 double-checkout). All reconciliation below
+        # reads `real`, never the caller's copy.
+        real = self.sessions.get(session.get("nonce") if isinstance(session, dict) else None)
+        if real is None:
+            raise GateError("no live session for this nonce")
+        entry = real["entry"]
         for f in ("agent_id", "agent_name", "last_gate", "nonce", "trust_level"):
             if exit_data[f] != entry[f]:
                 raise GateError(f"exit field {f!r} does not match entry")
         self._authenticate(exit_data)  # exit is signed too
-        if int(exit_data["timestamp"]) <= session["entry_ms"]:
+        if int(exit_data["timestamp"]) <= real["entry_ms"]:
             raise GateError("exit timestamp must be after entry")
         if int(exit_data["pass_count"]) < int(entry["pass_count"]):
             raise GateError("pass_count decreased")
@@ -336,26 +351,26 @@ class WillowGate:
 
         # Defense-in-depth: what was actually used must be within the grant.
         used = set(exit_data["tools"])
-        if not (used - {READ_TOOL}) <= session["granted_tools"]:
+        if not (used - {READ_TOOL}) <= real["granted_tools"]:
             raise GateError(
-                f"tools used {sorted(used)} exceed grant {sorted(session['granted_tools'])} "
+                f"tools used {sorted(used)} exceed grant {sorted(real['granted_tools'])} "
                 "— out-of-band tool use detected")
-        if not used <= session["tools_used"]:
+        if not used <= real["tools_used"]:
             # used a tool at exit it never cleared through authorize_tool()
             raise GateError("exit tool manifest includes unauthorized calls")
 
-        duration = int(exit_data["timestamp"]) - session["entry_ms"]
+        duration = int(exit_data["timestamp"]) - real["entry_ms"]
         diff = {
             "pass_delta": int(exit_data["pass_count"]) - int(entry["pass_count"]),
             "fail_delta": int(exit_data["fail_count"]) - int(entry["fail_count"]),
             "duration_ms": duration,
             "state_changed": exit_data["state_hash"] != entry["state_hash"],
-            "exports": session["exports"],
-            "tools_used": sorted(session["tools_used"]),
+            "exports": real["exports"],
+            "tools_used": sorted(real["tools_used"]),
         }
-        self._write_ledger(session["nonce"], "exit", {"exit": exit_data, "diff": diff})
-        self._announce(session, f"CHECK-OUT dur={duration}ms diff={diff}")
-        del self.sessions[session["nonce"]]
+        self._write_ledger(real["nonce"], "exit", {"exit": exit_data, "diff": diff})
+        self._announce(real, f"CHECK-OUT dur={duration}ms diff={diff}")
+        del self.sessions[real["nonce"]]
         return True, f"CHECK-OUT COMPLETE — {duration}ms, {diff['pass_delta']:+d} pass"
 
     # ── ledger / announcements ───────────────────────────────────────────────
