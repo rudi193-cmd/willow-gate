@@ -16,8 +16,28 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install lint tools
+        run: pip install ruff==0.15.0 bandit
+
+      - name: Ruff (enforced)
+        run: ruff check src tests
+
+      - name: Bandit (enforced — tree is clean, keep it that way)
+        run: bandit -r src -ll -q
+
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +50,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install package
         run: pip install -e ".[dev]"

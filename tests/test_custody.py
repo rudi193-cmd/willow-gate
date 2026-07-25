@@ -121,7 +121,7 @@ def test_persist_and_reload_verifies(tmp_path):
 # Tier 2 — the session layer (H5 check-out reconciliation)
 # ============================================================================
 from willow_gate.custody import (  # noqa: E402
-    Reconciliation, ChainError as _ChainError,
+    ChainError as _ChainError,
     session_check_in, session_record_action, session_check_out,
     KIND_SESSION_CHECKOUT,
 )
@@ -201,8 +201,7 @@ def test_declared_accepts_header_list_or_string():
 # ============================================================================
 import hashlib  # noqa: E402
 from willow_gate.custody import (  # noqa: E402
-    file_create, file_read, file_write, file_gate_cross, file_checkout,
-    file_lineage, verify_lineage, detect_capture_gap, lineage_has_gaps,
+    file_create, file_write, file_gate_cross, file_lineage, verify_lineage, detect_capture_gap, lineage_has_gaps,
     last_content_hash, KIND_CAPTURE_GAP, KIND_FILE_WRITE, KIND_FILE_CREATE,
 )
 
@@ -295,9 +294,7 @@ def test_file_gate_cross_redacts_live_secret():
 # ============================================================================
 # Hardening regression tests — one per confirmed audit finding
 # ============================================================================
-import unicodedata  # noqa: E402
 from willow_gate.custody import (  # noqa: E402
-    file_create, file_write, file_gate_cross, verify_lineage,
     KIND_SESSION_ACTION as _SA, event_hash as _eh, canonicalize as _canon,
 )
 
@@ -769,7 +766,6 @@ def test_forged_capture_gap_launders_lineage_documented_limit(tmp_path):
 # ============================================================================
 from willow_gate.custody import (  # noqa: E402
     file_read as _file_read, last_content_hash as _last_ch,
-    KIND_FILE_READ as _FR,
 )
 
 

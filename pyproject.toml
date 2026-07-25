@@ -17,3 +17,11 @@ dev = ["pytest"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/willow_gate"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint.per-file-ignores]
+# The test suite deliberately uses compact one-line setup statements
+# (`ev = dict(e); ev["seq"] = i`) and short loop names; don't fight it.
+"tests/*" = ["E702", "E741"]
