@@ -95,6 +95,19 @@ REQUIRED_FIELDS: Set[str] = {
 _SIGNED_FIELDS = sorted(REQUIRED_FIELDS - {"signature"})
 
 
+def canonical_header_bytes(header: Dict) -> bytes:
+    """The fleet's canonical signing encoding (box audit A6): a JSON object of
+    the signed fields, key-sorted, tight separators — a *structured* encoding, so
+    a delimiter inside a value cannot shift field boundaries and forge a
+    collision (the failure the old ``"\\x1f".join(...)`` seals had, willow-gate B/
+    Nestor B4). willow-mcp/session_binder and the-squirrel/sap gate MUST produce
+    byte-identical output for the same header; a shared golden vector pins it in
+    each repo (tests/test_signing_encoding.py) so the copies cannot silently
+    diverge again. Reuse this instead of hand-rolling a fourth copy."""
+    return json.dumps({k: header[k] for k in _SIGNED_FIELDS},
+                      sort_keys=True, separators=(",", ":")).encode()
+
+
 class GateError(Exception):
     """A hard stop. Never swallowed; surfaced immediately."""
 
@@ -206,8 +219,7 @@ class WillowGate:
         self._tally_file.write_text(json.dumps(self._tally))
 
     def _canonical(self, header: Dict) -> bytes:
-        return json.dumps({k: header[k] for k in _SIGNED_FIELDS},
-                          sort_keys=True, separators=(",", ":")).encode()
+        return canonical_header_bytes(header)
 
     def _expected_sig(self, agent_id: str, header: Dict) -> Optional[str]:
         rec = self._registry.get(agent_id)
