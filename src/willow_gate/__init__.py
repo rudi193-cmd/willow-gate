@@ -136,6 +136,20 @@ class WillowGate:
         self.sessions: Dict[str, Dict] = {}
         self.announcements_log = self.base_dir / "announcements.log"
 
+        # Earned-rung tally (B12): the trust-ladder thresholds (min_pass_count,
+        # max_fail_count) were checked against the agent's OWN signed header, so a
+        # first header claiming pass_count=999 bought Elder instantly — the rungs
+        # were self-certified. The gate now keeps its own per-agent count in
+        # base_dir (which the agent's uid cannot write — willow-gate#181), accrued
+        # from witnessed check-outs and capped by the tools it actually authorized.
+        # When WILLOW_GATE_ENFORCE_EARNED_RUNGS is set the rung gate reads THIS,
+        # not the header. Off by default: existing deployments keep header
+        # semantics until the operator seeds trust_tally.json and flips it on.
+        self._tally_file = self.base_dir / "trust_tally.json"
+        self._tally: Dict[str, Dict[str, int]] = {}
+        if self._tally_file.exists():
+            self._tally = json.loads(self._tally_file.read_text())
+
     # ── setup / crypto ──────────────────────────────────────────────────────
 
     def _verify_pgp(self) -> None:
@@ -161,10 +175,35 @@ class WillowGate:
             raise GateError("max_trust must be 0..4")
         self._registry[agent_id] = {"secret": secret.hex(), "max_trust": max_trust}
         self._registry_file.write_text(json.dumps(self._registry))
+        # A newly-registered agent starts at zero earned rungs — it climbs by
+        # doing gate-witnessed work, not by typing a number into its first header.
+        # An operator migrating an already-trusted agent seeds trust_tally.json.
+        if agent_id not in self._tally:
+            self._tally[agent_id] = {"pass": 0, "fail": 0}
+            self._tally_file.write_text(json.dumps(self._tally))
 
     def _load_registry(self) -> None:
         if self._registry_file.exists():
             self._registry = json.loads(self._registry_file.read_text())
+
+    @staticmethod
+    def _enforce_earned_rungs() -> bool:
+        """B12 master switch, read live. OFF by default so this lands without
+        demoting any live agent: header counts stay authoritative until an operator
+        seeds trust_tally.json with earned levels and turns this on. ON: the rung
+        thresholds read the gate's own accrued tally, not the self-signed header."""
+        return os.environ.get("WILLOW_GATE_ENFORCE_EARNED_RUNGS", "").strip().lower() in (
+            "1", "true", "yes", "on")
+
+    def _agent_tally(self, agent_id: str) -> Dict[str, int]:
+        t = self._tally.get(agent_id) or {}
+        return {"pass": int(t.get("pass", 0)), "fail": int(t.get("fail", 0))}
+
+    def _accrue_tally(self, agent_id: str, pass_delta: int, fail_delta: int) -> None:
+        t = self._tally.setdefault(agent_id, {"pass": 0, "fail": 0})
+        t["pass"] = int(t.get("pass", 0)) + max(0, int(pass_delta))
+        t["fail"] = int(t.get("fail", 0)) + max(0, int(fail_delta))
+        self._tally_file.write_text(json.dumps(self._tally))
 
     def _canonical(self, header: Dict) -> bytes:
         return json.dumps({k: header[k] for k in _SIGNED_FIELDS},
@@ -230,12 +269,21 @@ class WillowGate:
             raise GateError(
                 f"entry denied: {level.name} (level {trust}) may not open a session")
 
+        # Drift is a genuine per-session, self-reported timing signal — it stays
+        # from the header. The earned counts do NOT: when enforcement is on they
+        # come from the gate's own tally, so a first header claiming pass_count=999
+        # can no longer buy a rung it never earned (B12). Off → header, unchanged.
         if level.max_drift_ms is not None and abs(int(header["drift"])) > level.max_drift_ms:
             raise GateError(f"drift {header['drift']}ms exceeds {level.max_drift_ms}ms")
-        if level.max_fail_count is not None and int(header["fail_count"]) > level.max_fail_count:
-            raise GateError(f"fail_count {header['fail_count']} exceeds {level.max_fail_count}")
-        if level.min_pass_count is not None and int(header["pass_count"]) < level.min_pass_count:
-            raise GateError(f"pass_count {header['pass_count']} below required {level.min_pass_count}")
+        if self._enforce_earned_rungs():
+            earned = self._agent_tally(header["agent_id"])
+            earned_pass, earned_fail = earned["pass"], earned["fail"]
+        else:
+            earned_pass, earned_fail = int(header["pass_count"]), int(header["fail_count"])
+        if level.max_fail_count is not None and earned_fail > level.max_fail_count:
+            raise GateError(f"fail_count {earned_fail} exceeds {level.max_fail_count}")
+        if level.min_pass_count is not None and earned_pass < level.min_pass_count:
+            raise GateError(f"pass_count {earned_pass} below required {level.min_pass_count}")
 
         nonce = str(header["nonce"])
         if nonce in self._used:
@@ -368,6 +416,16 @@ class WillowGate:
             "tools_used": sorted(real["tools_used"]),
         }
         self._write_ledger(real["nonce"], "exit", {"exit": exit_data, "diff": diff})
+        # B12: accrue the earned-rung tally from what the gate actually witnessed
+        # this session. The claimed pass_delta is capped by the distinct tools the
+        # gate cleared through authorize_tool (real["tools_used"]), so a header
+        # cannot inflate the ladder faster than real gate-authorized work. Accrued
+        # even when enforcement is off, so the tally is populated and truthful the
+        # day an operator turns enforcement on.
+        self._accrue_tally(
+            real["agent_id"],
+            min(diff["pass_delta"], len(real["tools_used"])),
+            diff["fail_delta"])
         self._announce(real, f"CHECK-OUT dur={duration}ms diff={diff}")
         del self.sessions[real["nonce"]]
         return True, f"CHECK-OUT COMPLETE — {duration}ms, {diff['pass_delta']:+d} pass"
