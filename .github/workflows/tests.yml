@@ -60,11 +60,14 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Install package
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev]" coverage
 
-      - name: Run tests
+      - name: Run tests (under coverage)
         # python-gnupg wraps the gpg binary; ubuntu runners ship it.
-        run: python -m pytest tests/ -q
+        run: |
+          coverage run --include='src/willow_gate/*' -m pytest tests/ -q
+          # Floor, not target: measured 94.1% on master. Ratchet up, never down.
+          coverage report --fail-under=90
 
   # Aggregate gate: branch protection requires a single check named "test"
   # across the whole fleet. Green only when lint and every matrix leg are.
